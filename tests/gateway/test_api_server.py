@@ -697,7 +697,7 @@ class TestChatCompletionsEndpoint:
             assert resp.status == 200
             trace_id = resp.headers["X-Hermes-Trace-Id"]
             assert trace_id.startswith("api-")
-            assert len(trace_id) >= 16
+            assert len(trace_id) == len("api-") + 16
 
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):

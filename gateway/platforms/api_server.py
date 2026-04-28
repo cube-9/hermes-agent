@@ -69,7 +69,7 @@ TRACE_HEADER = "X-Hermes-Trace-Id"
 
 def _new_api_trace_id() -> str:
     """Generate a compact request trace id for API caller postmortems."""
-    return f"api-{uuid.uuid4().hex}"
+    return f"api-{uuid.uuid4().hex[:16]}"
 
 
 def _request_trace_id(request: "web.Request") -> str:
