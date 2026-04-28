@@ -6,6 +6,7 @@ import os
 from typing import Any
 
 _VOICE_HISTORY_LIMIT_DEFAULT = 8
+_VOICE_MEMORY_PREFETCH_CHAR_LIMIT_DEFAULT = 12_000
 
 
 def _is_voice_mode_chat_request(messages: list[dict[str, Any]] | None) -> bool:
@@ -36,6 +37,17 @@ def _voice_history_limit() -> int:
         return max(0, int(raw_limit))
     except (TypeError, ValueError):
         return _VOICE_HISTORY_LIMIT_DEFAULT
+
+
+def _voice_memory_prefetch_char_limit() -> int:
+    raw_limit = os.getenv(
+        "HERMES_VOICE_MAX_MEMORY_PREFETCH_CHARS",
+        str(_VOICE_MEMORY_PREFETCH_CHAR_LIMIT_DEFAULT),
+    )
+    try:
+        return max(0, int(raw_limit))
+    except (TypeError, ValueError):
+        return _VOICE_MEMORY_PREFETCH_CHAR_LIMIT_DEFAULT
 
 
 def _limit_voice_history(

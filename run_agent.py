@@ -79,7 +79,11 @@ from tools.browser_tool import cleanup_browser
 from hermes_constants import OPENROUTER_BASE_URL
 
 # Agent internals extracted to agent/ package for modularity
-from agent.memory_manager import build_memory_context_block, sanitize_context
+from agent.memory_manager import (
+    build_memory_context_block,
+    limit_memory_prefetch_context,
+    sanitize_context,
+)
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
@@ -754,6 +758,7 @@ class AIAgent:
         gateway_session_key: str = None,
         skip_context_files: bool = False,
         skip_memory: bool = False,
+        memory_prefetch_char_limit: int | None = None,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -828,6 +833,7 @@ class AIAgent:
         self._print_fn = None
         self.background_review_callback = None  # Optional sync callback for gateway delivery
         self.skip_context_files = skip_context_files
+        self.memory_prefetch_char_limit = memory_prefetch_char_limit
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
         self._credential_pool = credential_pool
@@ -8893,6 +8899,10 @@ class AIAgent:
             try:
                 _query = original_user_message if isinstance(original_user_message, str) else ""
                 _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
+                _ext_prefetch_cache = limit_memory_prefetch_context(
+                    _ext_prefetch_cache,
+                    self.memory_prefetch_char_limit,
+                )
             except Exception:
                 pass
 

@@ -62,6 +62,12 @@ def sanitize_context(text: str) -> str:
     return text
 
 
+def limit_memory_prefetch_context(context: str, char_limit: int | None) -> str:
+    if not context or char_limit is None or char_limit <= 0:
+        return context
+    return context[:char_limit]
+
+
 def build_memory_context_block(raw_context: str) -> str:
     """Wrap prefetched memory in a fenced block with system note.
 

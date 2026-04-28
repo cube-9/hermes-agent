@@ -46,7 +46,11 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
-from gateway.voice_context import _limit_voice_history
+from gateway.voice_context import (
+    _is_voice_mode_chat_request,
+    _limit_voice_history,
+    _voice_memory_prefetch_char_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -706,6 +710,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        memory_prefetch_char_limit: Optional[int] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -746,6 +751,7 @@ class APIServerAdapter(BasePlatformAdapter):
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
+            memory_prefetch_char_limit=memory_prefetch_char_limit,
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
@@ -910,7 +916,13 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
+        is_voice_mode = _is_voice_mode_chat_request(messages)
         history = _limit_voice_history(history, messages)
+        memory_prefetch_char_limit = (
+            _voice_memory_prefetch_char_limit()
+            if is_voice_mode
+            else None
+        )
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
@@ -970,6 +982,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                memory_prefetch_char_limit=memory_prefetch_char_limit,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
                 agent_ref=agent_ref,
@@ -987,6 +1000,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                memory_prefetch_char_limit=memory_prefetch_char_limit,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2167,6 +2181,7 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        memory_prefetch_char_limit: Optional[int] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -2190,6 +2205,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent = self._create_agent(
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
+                memory_prefetch_char_limit=memory_prefetch_char_limit,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,

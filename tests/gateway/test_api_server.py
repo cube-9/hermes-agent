@@ -33,7 +33,11 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
-from gateway.voice_context import _limit_voice_history, _voice_history_limit
+from gateway.voice_context import (
+    _limit_voice_history,
+    _voice_history_limit,
+    _voice_memory_prefetch_char_limit,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2204,6 +2208,7 @@ class TestSessionIdHeader:
         """Voice-mode requests cap OpenAI request-body history on the Pipecat path."""
         mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
         monkeypatch.setenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", "3")
+        monkeypatch.setenv("HERMES_VOICE_MAX_MEMORY_PREFETCH_CHARS", "1234")
 
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -2233,6 +2238,7 @@ class TestSessionIdHeader:
                 {"role": "assistant", "content": "old answer 2"},
             ]
             assert call_kwargs["user_message"] == "new voice question"
+            assert call_kwargs["memory_prefetch_char_limit"] == 1234
 
     def test_voice_history_limit_defaults_invalid_and_clamps_to_zero(self, monkeypatch):
         monkeypatch.delenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", raising=False)
@@ -2243,6 +2249,16 @@ class TestSessionIdHeader:
 
         monkeypatch.setenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", "-3")
         assert _voice_history_limit() == 0
+
+    def test_voice_memory_prefetch_limit_defaults_invalid_and_clamps_to_zero(self, monkeypatch):
+        monkeypatch.delenv("HERMES_VOICE_MAX_MEMORY_PREFETCH_CHARS", raising=False)
+        assert _voice_memory_prefetch_char_limit() == 12000
+
+        monkeypatch.setenv("HERMES_VOICE_MAX_MEMORY_PREFETCH_CHARS", "invalid")
+        assert _voice_memory_prefetch_char_limit() == 12000
+
+        monkeypatch.setenv("HERMES_VOICE_MAX_MEMORY_PREFETCH_CHARS", "-3")
+        assert _voice_memory_prefetch_char_limit() == 0
 
     def test_limit_voice_history_only_applies_with_voice_marker(self, monkeypatch):
         history = [{"role": "user", "content": str(index)} for index in range(4)]
