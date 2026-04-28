@@ -80,6 +80,13 @@ def _request_trace_id(request: "web.Request") -> str:
     return re.sub(r"[^A-Za-z0-9_.:-]", "-", raw_trace_id)[:128] or _new_api_trace_id()
 
 
+def _log_safe(value: Any, *, max_length: int = 128) -> str:
+    """Make user-controlled scalar values safe for single-line structured logs."""
+    text = str(value)
+    safe = "".join(ch if ch.isprintable() and ch not in "\r\n\t" else "-" for ch in text)
+    return safe[:max_length]
+
+
 def _messages_summary(messages: List[Any]) -> Dict[str, Any]:
     """Summarize chat messages for one-line request logging."""
     roles: List[str] = []
@@ -90,14 +97,14 @@ def _messages_summary(messages: List[Any]) -> Dict[str, Any]:
     for msg in messages:
         if not isinstance(msg, dict):
             continue
-        role = str(msg.get("role", ""))
-        roles.append(role)
+        raw_role = str(msg.get("role", ""))
+        roles.append(_log_safe(raw_role, max_length=64))
         content_length = len(_normalize_chat_content(msg.get("content", "")))
-        if role == "user":
+        if raw_role == "user":
             user_chars += content_length
-        elif role == "assistant":
+        elif raw_role == "assistant":
             assistant_chars += content_length
-        elif role == "system":
+        elif raw_role == "system":
             system_chars += content_length
 
     return {
@@ -450,7 +457,8 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": f"Authorization, Content-Type, Idempotency-Key, {TRACE_HEADER}",
+    "Access-Control-Expose-Headers": f"{TRACE_HEADER}, X-Hermes-Session-Id",
 }
 
 
@@ -1145,7 +1153,7 @@ class APIServerAdapter(BasePlatformAdapter):
             trace_id,
             completion_id,
             session_id,
-            model_name,
+            _log_safe(model_name),
             stream,
             is_voice_mode,
             messages_summary["count"],
