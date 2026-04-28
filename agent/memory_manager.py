@@ -59,6 +59,12 @@ def sanitize_context(text: str) -> str:
     return text
 
 
+def limit_memory_prefetch_context(context: str, char_limit: int | None) -> str:
+    if not context or char_limit is None or char_limit <= 0:
+        return context
+    return context[:char_limit]
+
+
 class StreamingContextScrubber:
     """Stateful scrubber for streaming text that may contain split memory-context spans.
 
