@@ -521,6 +521,17 @@ class TestModelsEndpoint:
 
 
 class TestChatCompletionsEndpoint:
+    @staticmethod
+    def _streamed_chat_delta_text(body):
+        streamed_text = ""
+        for line in body.splitlines():
+            if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                continue
+            chunk = json.loads(line[len("data: "):])
+            for choice in chunk.get("choices", []):
+                streamed_text += choice.get("delta", {}).get("content", "")
+        return streamed_text
+
     def test_log_safe_replaces_controls_and_caps_length(self):
         assert _log_safe("abc\n\x00\tdef", max_length=20) == "abc---def"
         assert _log_safe("x" * 10, max_length=4) == "xxxx"
@@ -716,19 +727,46 @@ class TestChatCompletionsEndpoint:
                 body = await resp.text()
 
             assert resp.status == 200
-            streamed_text = ""
-            for line in body.splitlines():
-                if not line.startswith("data: ") or line.strip() == "data: [DONE]":
-                    continue
-                chunk = json.loads(line[len("data: "):])
-                for choice in chunk.get("choices", []):
-                    streamed_text += choice.get("delta", {}).get("content", "")
-            assert streamed_text == "Hello"
+            assert self._streamed_chat_delta_text(body) == "Hello"
             log_text = "\n".join(record.getMessage() for record in caplog.records)
             assert "api stream first_text_delta trace_id=trace-stream-ok" in log_text
             assert "api stream completed trace_id=trace-stream-ok" in log_text
             assert "text_chunks=2" in log_text
             assert "text_chars=5" in log_text
+
+    @pytest.mark.asyncio
+    async def test_stream_warns_when_final_response_was_not_emitted(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {"final_response": "Hello", "messages": [], "api_calls": 1},
+                    {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Trace-Id": "trace-no-delta"},
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert self._streamed_chat_delta_text(body) == ""
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream zero body trace_id=trace-no-delta" in log_text
+            assert "api stream completed trace_id=trace-no-delta" not in log_text
+            assert "text_chunks=0" in log_text
+            assert "text_chars=0" in log_text
+            assert "final_response_chars=5" in log_text
 
     @pytest.mark.asyncio
     async def test_stream_logs_zero_body_warning(self, adapter, caplog):
@@ -761,6 +799,76 @@ class TestChatCompletionsEndpoint:
             assert "api stream zero body trace_id=trace-zero-body" in log_text
             assert "text_chunks=0" in log_text
             assert "final_response_chars=0" in log_text
+
+    @pytest.mark.asyncio
+    async def test_stream_agent_exception_emits_error_event_before_deltas(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                raise RuntimeError("agent exploded")
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.ERROR, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Trace-Id": "trace-fail-before"},
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "event: error" in body
+            assert "agent exploded" in body
+            assert "trace-fail-before" in body
+            assert '"finish_reason": "stop"' not in body
+            assert "[DONE]" not in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream failed trace_id=trace-fail-before" in log_text
+            assert "text_chunks=0" in log_text
+            assert "text_chars=0" in log_text
+
+    @pytest.mark.asyncio
+    async def test_stream_agent_exception_emits_error_event_after_delta(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Partial")
+                raise RuntimeError("agent failed late")
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.ERROR, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Trace-Id": "trace-fail-after"},
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert self._streamed_chat_delta_text(body) == "Partial"
+            assert "event: error" in body
+            assert "agent failed late" in body
+            assert "trace-fail-after" in body
+            assert '"finish_reason": "stop"' not in body
+            assert "[DONE]" not in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream failed trace_id=trace-fail-after" in log_text
+            assert "text_chunks=1" in log_text
+            assert "text_chars=7" in log_text
 
     @pytest.mark.asyncio
     async def test_stream_sends_keepalive_during_quiet_tool_gap(self, adapter):
