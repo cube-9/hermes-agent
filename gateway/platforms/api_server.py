@@ -951,7 +951,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 if db is not None:
                     history = db.get_messages_as_conversation(session_id)
             except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
+                logger.warning("Failed to load session history for %s: %s", _log_safe(session_id), e)
                 history = []
         else:
             # Derive a stable session ID from the conversation fingerprint so
@@ -980,7 +980,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "message_count=%s roles=%s user_chars=%s assistant_chars=%s system_chars=%s",
             trace_id,
             completion_id,
-            session_id,
+            _log_safe(session_id),
             _log_safe(model_name),
             stream,
             is_voice_mode,

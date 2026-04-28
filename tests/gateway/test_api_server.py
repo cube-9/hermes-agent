@@ -584,37 +584,45 @@ class TestChatCompletionsEndpoint:
             assert len(trace_id) == len("api-") + 16
 
     @pytest.mark.asyncio
-    async def test_chat_completion_request_start_log_sanitizes_user_strings(self, adapter, caplog):
+    async def test_chat_completion_request_start_log_sanitizes_user_strings(self, auth_adapter, caplog):
         """Request-start logs should not contain raw control characters from model or role fields."""
-        app = _create_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            async def _mock_run_agent(**kwargs):
-                return (
-                    {"final_response": "ok", "messages": [], "api_calls": 1},
-                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-                )
+        raw_session_id = "session-\x1b[" + ("x" * 160)
+        request = MagicMock()
+        request.headers = {
+            "Authorization": "Bearer sk-secret",
+            "X-Hermes-Session-Id": raw_session_id,
+        }
+        request.json = AsyncMock(return_value={
+            "model": "unsafe\nmodel\x00name",
+            "messages": [
+                {"role": "system\nrole\x00name", "content": "ignored"},
+                {"role": "user", "content": "hello"},
+            ],
+        })
 
-            with (
-                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
-                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
-            ):
-                resp = await cli.post(
-                    "/v1/chat/completions",
-                    json={
-                        "model": "unsafe\nmodel\x00name",
-                        "messages": [
-                            {"role": "system\nrole\x00name", "content": "ignored"},
-                            {"role": "user", "content": "hello"},
-                        ],
-                    },
-                )
+        async def _mock_run_agent(**kwargs):
+            return (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
 
-            assert resp.status == 200
-            log_text = "\n".join(record.getMessage() for record in caplog.records)
-            assert "model=unsafe-model-name" in log_text
-            assert "roles=system-role-name,user" in log_text
-            assert "unsafe\nmodel" not in log_text
-            assert "system\nrole" not in log_text
+        with (
+            patch.object(auth_adapter, "_ensure_session_db", side_effect=RuntimeError("db down")),
+            patch.object(auth_adapter, "_run_agent", side_effect=_mock_run_agent),
+            caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+        ):
+            resp = await auth_adapter._handle_chat_completions(request)
+
+        assert resp.status == 200
+        assert resp.headers["X-Hermes-Session-Id"] == raw_session_id
+        log_text = "\n".join(record.getMessage() for record in caplog.records)
+        assert "model=unsafe-model-name" in log_text
+        assert "roles=system-role-name,user" in log_text
+        assert f"session_id={_log_safe(raw_session_id)}" in log_text
+        assert f"Failed to load session history for {_log_safe(raw_session_id)}" in log_text
+        assert "unsafe\nmodel" not in log_text
+        assert "system\nrole" not in log_text
+        assert raw_session_id not in log_text
 
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
