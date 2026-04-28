@@ -52,8 +52,6 @@ from gateway.platforms.base import (
 )
 from gateway.voice_context import (
     _is_voice_mode_chat_request,
-    _limit_voice_history,
-    _voice_memory_prefetch_char_limit,
 )
 
 logger = logging.getLogger(__name__)
