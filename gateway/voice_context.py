@@ -14,6 +14,8 @@ def _is_voice_mode_chat_request(messages: list[dict[str, Any]] | None) -> bool:
     for message in messages:
         if not isinstance(message, dict):
             continue
+        if message.get("role") != "system":
+            continue
         content = message.get("content", "")
         if isinstance(content, str) and "HERMES_VOICE_MODE=1" in content:
             return True
