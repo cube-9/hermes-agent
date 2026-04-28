@@ -33,6 +33,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.voice_context import _limit_voice_history, _voice_history_limit
 
 
 # ---------------------------------------------------------------------------
@@ -2159,6 +2160,69 @@ class TestSessionIdHeader:
             # History must come from DB, not from the request body
             assert call_kwargs["conversation_history"] == db_history
             assert call_kwargs["user_message"] == "new question"
+
+    @pytest.mark.asyncio
+    async def test_voice_session_id_limits_loaded_db_history(self, auth_adapter, monkeypatch):
+        """Voice-mode requests cap DB-loaded history before passing it to the agent."""
+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+        db_history = [
+            {"role": "user", "content": f"stored message {index}"}
+            for index in range(6)
+        ]
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = db_history
+        auth_adapter._session_db = mock_db
+        monkeypatch.setenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", "2")
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "existing-session", "Authorization": "Bearer sk-secret"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "HERMES_VOICE_MODE=1 realtime voice session",
+                            },
+                            {"role": "user", "content": "new voice question"},
+                        ],
+                    },
+                )
+
+            assert resp.status == 200
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["conversation_history"] == db_history[-2:]
+            assert call_kwargs["user_message"] == "new voice question"
+
+    def test_voice_history_limit_defaults_invalid_and_clamps_to_zero(self, monkeypatch):
+        monkeypatch.delenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", raising=False)
+        assert _voice_history_limit() == 8
+
+        monkeypatch.setenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", "invalid")
+        assert _voice_history_limit() == 8
+
+        monkeypatch.setenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", "-3")
+        assert _voice_history_limit() == 0
+
+    def test_limit_voice_history_only_applies_with_voice_marker(self, monkeypatch):
+        history = [{"role": "user", "content": str(index)} for index in range(4)]
+        non_voice_messages = [{"role": "user", "content": "hello"}]
+        voice_messages = [
+            {"role": "system", "content": "HERMES_VOICE_MODE=1"},
+            {"role": "user", "content": "hello"},
+        ]
+        monkeypatch.setenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", "2")
+
+        assert _limit_voice_history(history, non_voice_messages) == history
+        assert _limit_voice_history(history, voice_messages) == history[-2:]
+
+        monkeypatch.setenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", "0")
+        assert _limit_voice_history(history, voice_messages) == []
 
     @pytest.mark.asyncio
     async def test_db_failure_falls_back_to_empty_history(self, auth_adapter):
