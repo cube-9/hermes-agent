@@ -30,6 +30,7 @@ from gateway.platforms.api_server import (
     _IdempotencyCache,
     _CORS_HEADERS,
     _derive_chat_session_id,
+    _log_safe,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -520,6 +521,11 @@ class TestModelsEndpoint:
 
 
 class TestChatCompletionsEndpoint:
+    def test_log_safe_replaces_controls_and_caps_length(self):
+        assert _log_safe("abc\n\x00\tdef", max_length=20) == "abc---def"
+        assert _log_safe("x" * 10, max_length=4) == "xxxx"
+        assert _log_safe(123, max_length=10) == "123"
+
     @pytest.mark.asyncio
     async def test_chat_completion_accepts_voice_trace_header(self, adapter, caplog):
         """Voice callers can provide a trace id that appears in logs and response headers."""
@@ -576,6 +582,39 @@ class TestChatCompletionsEndpoint:
             trace_id = resp.headers["X-Hermes-Trace-Id"]
             assert trace_id.startswith("api-")
             assert len(trace_id) == len("api-") + 16
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_request_start_log_sanitizes_user_strings(self, adapter, caplog):
+        """Request-start logs should not contain raw control characters from model or role fields."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "unsafe\nmodel\x00name",
+                        "messages": [
+                            {"role": "system\nrole\x00name", "content": "ignored"},
+                            {"role": "user", "content": "hello"},
+                        ],
+                    },
+                )
+
+            assert resp.status == 200
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "model=unsafe-model-name" in log_text
+            assert "roles=system-role-name,user" in log_text
+            assert "unsafe\nmodel" not in log_text
+            assert "system\nrole" not in log_text
 
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
@@ -1993,6 +2032,56 @@ class TestCORS:
             )
             assert resp.status == 200
             assert "Idempotency-Key" in resp.headers.get("Access-Control-Allow-Headers", "")
+
+    @pytest.mark.asyncio
+    async def test_cors_allows_trace_header_and_exposes_response_ids(self):
+        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.options(
+                "/v1/chat/completions",
+                headers={
+                    "Origin": "http://localhost:3000",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "X-Hermes-Trace-Id",
+                },
+            )
+            assert resp.status == 200
+            assert "X-Hermes-Trace-Id" in resp.headers.get("Access-Control-Allow-Headers", "")
+            expose_headers = resp.headers.get("Access-Control-Expose-Headers", "")
+            assert "X-Hermes-Trace-Id" in expose_headers
+            assert "X-Hermes-Session-Id" in expose_headers
+
+    @pytest.mark.asyncio
+    async def test_cors_exposes_trace_and_session_headers_on_chat_completion(self):
+        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Origin": "http://localhost:3000",
+                        "X-Hermes-Trace-Id": "browser-trace-123",
+                    },
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+
+            assert resp.status == 200
+            assert resp.headers["X-Hermes-Trace-Id"] == "browser-trace-123"
+            assert resp.headers.get("X-Hermes-Session-Id")
+            expose_headers = resp.headers.get("Access-Control-Expose-Headers", "")
+            assert "X-Hermes-Trace-Id" in expose_headers
+            assert "X-Hermes-Session-Id" in expose_headers
 
     @pytest.mark.asyncio
     async def test_cors_sets_vary_origin_header(self):
