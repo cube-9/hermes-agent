@@ -31,11 +31,7 @@ from datetime import datetime
 from typing import Dict, Optional, Any, List
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
-from gateway.voice_context import (
-    _is_voice_mode_chat_request,
-    _limit_voice_history,
-    _voice_history_limit,
-)
+from gateway.voice_context import _is_voice_mode_chat_request
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
