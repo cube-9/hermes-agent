@@ -838,7 +838,14 @@ class TestChatCompletionsEndpoint:
                 body = await resp.text()
 
             assert resp.status == 200
-            assert "Hello" in body
+            streamed_text = ""
+            for line in body.splitlines():
+                if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                    continue
+                chunk = json.loads(line[len("data: "):])
+                for choice in chunk.get("choices", []):
+                    streamed_text += choice.get("delta", {}).get("content", "")
+            assert streamed_text == "Hello"
             log_text = "\n".join(record.getMessage() for record in caplog.records)
             assert "api stream first_text_delta trace_id=trace-stream-ok" in log_text
             assert "api stream completed trace_id=trace-stream-ok" in log_text
