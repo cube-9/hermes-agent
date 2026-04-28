@@ -61,6 +61,8 @@ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 TRACE_HEADER = "X-Hermes-Trace-Id"
+VOICE_SESSION_HEADER = "X-Hermes-Voice-Session-Id"
+VOICE_TURN_HEADER = "X-Hermes-Voice-Turn-Id"
 
 
 def _new_api_trace_id() -> str:
@@ -873,6 +875,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
         trace_id = _request_trace_id(request)
+        voice_session_id = request.headers.get(VOICE_SESSION_HEADER, "").strip()
+        voice_turn_id = request.headers.get(VOICE_TURN_HEADER, "").strip()
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
             return web.json_response(
@@ -977,6 +981,7 @@ class APIServerAdapter(BasePlatformAdapter):
         logger.info(
             "api request started trace_id=%s endpoint=/v1/chat/completions "
             "completion_id=%s session_id=%s model=%s stream=%s voice_mode=%s "
+            "voice_session_id=%s voice_turn_id=%s "
             "message_count=%s roles=%s user_chars=%s assistant_chars=%s system_chars=%s",
             trace_id,
             completion_id,
@@ -984,6 +989,8 @@ class APIServerAdapter(BasePlatformAdapter):
             _log_safe(model_name),
             stream,
             is_voice_mode,
+            _log_safe(voice_session_id),
+            _log_safe(voice_turn_id),
             messages_summary["count"],
             messages_summary["roles"],
             messages_summary["user_chars"],
@@ -1050,11 +1057,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
                 agent_ref=agent_ref,
+                api_trace_id=trace_id,
+                api_voice_session_id=voice_session_id,
+                api_voice_turn_id=voice_turn_id,
             ))
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id, trace_id=trace_id,
+                voice_session_id=voice_session_id, voice_turn_id=voice_turn_id,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -1066,6 +1077,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 memory_prefetch_char_limit=memory_prefetch_char_limit,
                 voice_mode=is_voice_mode,
+                api_trace_id=trace_id,
+                api_voice_session_id=voice_session_id,
+                api_voice_turn_id=voice_turn_id,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1121,6 +1135,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
         trace_id: str = None,
+        voice_session_id: str = "",
+        voice_turn_id: str = "",
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -1341,7 +1357,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     await agent_task
                 except (asyncio.CancelledError, Exception):
                     pass
-            logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
+            logger.info(
+                "SSE client disconnected; interrupted agent task %s trace_id=%s session_id=%s "
+                "voice_session_id=%s voice_turn_id=%s",
+                completion_id,
+                trace_id,
+                _log_safe(session_id),
+                _log_safe(voice_session_id),
+                _log_safe(voice_turn_id),
+            )
 
         return response
 
@@ -2349,6 +2373,9 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
+        api_trace_id: str | None = None,
+        api_voice_session_id: str | None = None,
+        api_voice_turn_id: str | None = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2362,6 +2389,14 @@ class APIServerAdapter(BasePlatformAdapter):
         another thread to stop in-progress LLM calls.
         """
         loop = asyncio.get_running_loop()
+        if api_trace_id:
+            logger.info(
+                "api agent task started trace_id=%s session_id=%s voice_session_id=%s voice_turn_id=%s",
+                api_trace_id,
+                session_id,
+                _log_safe(api_voice_session_id or ""),
+                _log_safe(api_voice_turn_id or ""),
+            )
 
         def _run():
             agent = self._create_agent(
@@ -2388,7 +2423,19 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             return result, usage
 
-        return await loop.run_in_executor(None, _run)
+        result_tuple = await loop.run_in_executor(None, _run)
+        if api_trace_id:
+            result, _usage = result_tuple
+            logger.info(
+                "api agent task completed trace_id=%s session_id=%s voice_session_id=%s "
+                "voice_turn_id=%s final_response_chars=%s",
+                api_trace_id,
+                session_id,
+                _log_safe(api_voice_session_id or ""),
+                _log_safe(api_voice_turn_id or ""),
+                len(str(result.get("final_response", ""))) if isinstance(result, dict) else 0,
+            )
+        return result_tuple
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming

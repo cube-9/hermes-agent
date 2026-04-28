@@ -538,23 +538,32 @@ class TestChatCompletionsEndpoint:
         assert _log_safe(123, max_length=10) == "123"
 
     @pytest.mark.asyncio
-    async def test_chat_completion_accepts_voice_trace_header(self, adapter, caplog):
+    async def test_chat_completions_api_request_started_accepts_voice_trace_header(self, adapter, caplog):
         """Voice callers can provide a trace id that appears in logs and response headers."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            async def _mock_run_agent(**kwargs):
-                return (
-                    {"final_response": "ok", "messages": [], "api_calls": 1},
-                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-                )
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "ok",
+                "messages": [],
+                "api_calls": 1,
+            }
+            mock_agent.session_prompt_tokens = 1
+            mock_agent.session_completion_tokens = 1
+            mock_agent.session_total_tokens = 2
 
             with (
-                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                patch.object(adapter, "_create_agent", return_value=mock_agent),
                 caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
             ):
                 resp = await cli.post(
                     "/v1/chat/completions",
-                    headers={"X-Hermes-Trace-Id": "voice-session-123"},
+                    headers={
+                        "Authorization": "Bearer test-key",
+                        "X-Hermes-Trace-Id": "voice-session-123-turn-1",
+                        "X-Hermes-Voice-Session-Id": "session-123",
+                        "X-Hermes-Voice-Turn-Id": "1",
+                    },
                     json={
                         "model": "test",
                         "messages": [{"role": "user", "content": "hello"}],
@@ -562,10 +571,14 @@ class TestChatCompletionsEndpoint:
                 )
 
             assert resp.status == 200
-            assert resp.headers["X-Hermes-Trace-Id"] == "voice-session-123"
+            assert resp.headers["X-Hermes-Trace-Id"] == "voice-session-123-turn-1"
             log_text = "\n".join(record.getMessage() for record in caplog.records)
             assert "api request started" in log_text
-            assert "trace_id=voice-session-123" in log_text
+            assert "trace_id=voice-session-123-turn-1" in log_text
+            assert "voice_session_id=session-123" in log_text
+            assert "voice_turn_id=1" in log_text
+            assert "api agent task started trace_id=voice-session-123-turn-1" in log_text
+            assert "api agent task completed trace_id=voice-session-123-turn-1" in log_text
             assert "endpoint=/v1/chat/completions" in log_text
             assert "stream=False" in log_text
 
