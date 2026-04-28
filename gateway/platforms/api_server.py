@@ -1405,6 +1405,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             last_activity = time.monotonic()
+            stream_started = last_activity
+            first_text_delta_at = None
+            text_chunks = 0
+            text_chars = 0
+            tool_progress_events = 0
+            keepalive_count = 0
+            safe_session_id = _log_safe(session_id)
 
             # Role chunk
             role_chunk = {
@@ -1426,16 +1433,35 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
+                nonlocal first_text_delta_at
+                nonlocal text_chunks
+                nonlocal text_chars
+                nonlocal tool_progress_events
+
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
+                    tool_progress_events += 1
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
                 else:
+                    text = str(item)
+                    if first_text_delta_at is None:
+                        first_text_delta_at = time.monotonic()
+                        logger.info(
+                            "api stream first_text_delta trace_id=%s completion_id=%s "
+                            "session_id=%s elapsed_ms=%s",
+                            trace_id,
+                            completion_id,
+                            safe_session_id,
+                            int((first_text_delta_at - stream_started) * 1000),
+                        )
+                    text_chunks += 1
+                    text_chars += len(text)
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
                     }
                     await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 return time.monotonic()
@@ -1459,6 +1485,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         break
                     if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
                         await response.write(b": keepalive\n\n")
+                        keepalive_count += 1
                         last_activity = time.monotonic()
                     continue
 
@@ -1469,17 +1496,60 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            final_response_text = ""
+            final_response_chars = 0
             try:
                 result, agent_usage = await agent_task
+                final_response_text = str((result or {}).get("final_response") or "")
+                final_response_chars = len(final_response_text)
                 usage = agent_usage or usage
-            except Exception as exc:
-                logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
+            except Exception as e:
+                logger.exception(
+                    "api stream agent task failed trace_id=%s completion_id=%s session_id=%s error=%s",
+                    trace_id,
+                    completion_id,
+                    safe_session_id,
+                    e,
+                )
+
+            elapsed_ms = int((time.monotonic() - stream_started) * 1000)
+            if text_chunks == 0 and final_response_chars == 0:
+                logger.warning(
+                    "api stream zero body trace_id=%s completion_id=%s session_id=%s "
+                    "elapsed_ms=%s text_chunks=%s text_chars=%s final_response_chars=%s "
+                    "keepalives=%s tool_progress_events=%s",
+                    trace_id,
+                    completion_id,
+                    safe_session_id,
+                    elapsed_ms,
+                    text_chunks,
+                    text_chars,
+                    final_response_chars,
+                    keepalive_count,
+                    tool_progress_events,
+                )
+            else:
+                logger.info(
+                    "api stream completed trace_id=%s completion_id=%s session_id=%s "
+                    "elapsed_ms=%s text_chunks=%s text_chars=%s final_response_chars=%s "
+                    "keepalives=%s tool_progress_events=%s",
+                    trace_id,
+                    completion_id,
+                    safe_session_id,
+                    elapsed_ms,
+                    text_chunks,
+                    text_chars,
+                    final_response_chars,
+                    keepalive_count,
+                    tool_progress_events,
+                )
 
             # Finish chunk
             finish_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
                 "created": created, "model": model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "final_response": final_response_text,
                 "usage": {
                     "prompt_tokens": usage.get("input_tokens", 0),
                     "completion_tokens": usage.get("output_tokens", 0),

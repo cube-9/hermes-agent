@@ -809,6 +809,75 @@ class TestChatCompletionsEndpoint:
                 assert "Hello!" in body
 
     @pytest.mark.asyncio
+    async def test_stream_logs_chunk_and_completion_metrics(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Hel")
+                    cb("lo")
+                return (
+                    {"final_response": "Hello", "messages": [], "api_calls": 1},
+                    {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Trace-Id": "trace-stream-ok"},
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "Hello" in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream first_text_delta trace_id=trace-stream-ok" in log_text
+            assert "api stream completed trace_id=trace-stream-ok" in log_text
+            assert "text_chunks=2" in log_text
+            assert "text_chars=5" in log_text
+
+    @pytest.mark.asyncio
+    async def test_stream_logs_zero_body_warning(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {"final_response": "", "messages": [], "api_calls": 1},
+                    {"input_tokens": 2, "output_tokens": 0, "total_tokens": 2},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.WARNING, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Trace-Id": "trace-zero-body"},
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "[DONE]" in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream zero body trace_id=trace-zero-body" in log_text
+            assert "text_chunks=0" in log_text
+            assert "final_response_chars=0" in log_text
+
+    @pytest.mark.asyncio
     async def test_stream_sends_keepalive_during_quiet_tool_gap(self, adapter):
         """Idle SSE streams should send keepalive comments while tools run silently."""
         import asyncio
