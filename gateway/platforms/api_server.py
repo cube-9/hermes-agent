@@ -1498,22 +1498,46 @@ class APIServerAdapter(BasePlatformAdapter):
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
             final_response_text = ""
             final_response_chars = 0
+            agent_error = None
             try:
                 result, agent_usage = await agent_task
                 final_response_text = str((result or {}).get("final_response") or "")
                 final_response_chars = len(final_response_text)
                 usage = agent_usage or usage
             except Exception as e:
+                agent_error = e
+                elapsed_ms = int((time.monotonic() - stream_started) * 1000)
                 logger.exception(
-                    "api stream agent task failed trace_id=%s completion_id=%s session_id=%s error=%s",
+                    "api stream failed trace_id=%s completion_id=%s session_id=%s "
+                    "elapsed_ms=%s text_chunks=%s text_chars=%s final_response_chars=%s "
+                    "keepalives=%s tool_progress_events=%s error=%s",
                     trace_id,
                     completion_id,
                     safe_session_id,
+                    elapsed_ms,
+                    text_chunks,
+                    text_chars,
+                    final_response_chars,
+                    keepalive_count,
+                    tool_progress_events,
                     e,
                 )
+                error_event = {
+                    "error": {
+                        "message": str(e),
+                        "type": "server_error",
+                    },
+                    "trace_id": trace_id,
+                    "completion_id": completion_id,
+                    "session_id": safe_session_id,
+                }
+                await response.write(f"event: error\ndata: {json.dumps(error_event)}\n\n".encode())
+
+            if agent_error is not None:
+                return response
 
             elapsed_ms = int((time.monotonic() - stream_started) * 1000)
-            if text_chunks == 0 and final_response_chars == 0:
+            if text_chars == 0:
                 logger.warning(
                     "api stream zero body trace_id=%s completion_id=%s session_id=%s "
                     "elapsed_ms=%s text_chunks=%s text_chars=%s final_response_chars=%s "
