@@ -50,6 +50,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from gateway.voice_context import _limit_voice_history
 
 logger = logging.getLogger(__name__)
 
@@ -1068,6 +1069,7 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
+            history = _limit_voice_history(history, messages)
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)
