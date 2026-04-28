@@ -287,13 +287,14 @@ class TestAdapterInit:
         assert isinstance(agent, FakeAgent)
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
 
-    def test_voice_mode_create_agent_disables_api_tools_and_uses_voice_iteration_limit(self, adapter, monkeypatch):
+    def test_voice_mode_create_agent_uses_api_server_toolsets_and_normal_iteration_budget(self, adapter, monkeypatch):
         created = {}
 
         class FakeAgent:
             def __init__(self, **kwargs):
                 created.update(kwargs)
 
+        monkeypatch.setenv("HERMES_MAX_ITERATIONS", "90")
         monkeypatch.setenv("HERMES_VOICE_MAX_ITERATIONS", "2")
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
 
@@ -301,14 +302,14 @@ class TestAdapterInit:
             patch("run_agent.AIAgent", FakeAgent),
             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
             patch("gateway.run._resolve_gateway_model", return_value="test-model"),
-            patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": ["files"]}}),
-            patch("hermes_cli.tools_config._get_platform_tools", return_value={"files"}),
+            patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": ["files", "memory"]}}),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value={"files", "memory"}),
             patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None),
         ):
             adapter._create_agent(voice_mode=True)
 
-        assert created["enabled_toolsets"] == []
-        assert created["max_iterations"] == 2
+        assert created["enabled_toolsets"] == ["files", "memory"]
+        assert created["max_iterations"] == 90
 
 
 # ---------------------------------------------------------------------------
@@ -2887,8 +2888,8 @@ class TestSessionIdHeader:
             assert call_kwargs["user_message"] == "new question"
 
     @pytest.mark.asyncio
-    async def test_voice_session_id_limits_loaded_db_history(self, auth_adapter, monkeypatch):
-        """Voice-mode requests cap DB-loaded history before passing it to the agent."""
+    async def test_voice_session_id_keeps_loaded_db_history(self, auth_adapter, monkeypatch):
+        """Voice-mode requests keep DB-loaded history before passing it to the agent."""
         mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
         db_history = [
             {"role": "user", "content": f"stored message {index}"}
@@ -2921,12 +2922,12 @@ class TestSessionIdHeader:
 
             assert resp.status == 200
             call_kwargs = mock_run.call_args.kwargs
-            assert call_kwargs["conversation_history"] == db_history[-2:]
+            assert call_kwargs["conversation_history"] == db_history
             assert call_kwargs["user_message"] == "new voice question"
 
     @pytest.mark.asyncio
-    async def test_voice_mode_limits_request_body_history_without_session_header(self, adapter, monkeypatch):
-        """Voice-mode requests cap OpenAI request-body history on the Pipecat path."""
+    async def test_voice_mode_keeps_request_body_history_without_session_header(self, adapter, monkeypatch):
+        """Voice-mode requests keep OpenAI request-body history on the Pipecat path."""
         mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
         monkeypatch.setenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", "3")
         monkeypatch.setenv("HERMES_VOICE_MAX_MEMORY_PREFETCH_CHARS", "1234")
@@ -2954,12 +2955,13 @@ class TestSessionIdHeader:
             assert resp.status == 200
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["conversation_history"] == [
+                {"role": "user", "content": "old question 1"},
                 {"role": "assistant", "content": "old answer 1"},
                 {"role": "user", "content": "old question 2"},
                 {"role": "assistant", "content": "old answer 2"},
             ]
             assert call_kwargs["user_message"] == "new voice question"
-            assert call_kwargs["memory_prefetch_char_limit"] == 1234
+            assert call_kwargs["memory_prefetch_char_limit"] is None
             assert call_kwargs["voice_mode"] is True
 
     @pytest.mark.asyncio
