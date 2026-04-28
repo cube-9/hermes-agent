@@ -833,6 +833,47 @@ class TestChatCompletionsEndpoint:
                 assert "Hello!" in body
 
     @pytest.mark.asyncio
+    async def test_streaming_voice_trace_headers_reach_run_agent_lifecycle(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.side_effect = lambda **_kwargs: {
+                "final_response": "Hello stream",
+                "messages": [],
+                "api_calls": 1,
+            }
+            mock_agent.session_prompt_tokens = 1
+            mock_agent.session_completion_tokens = 2
+            mock_agent.session_total_tokens = 3
+
+            with (
+                patch.object(adapter, "_create_agent", return_value=mock_agent),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Trace-Id": "voice-session-123-turn-2",
+                        "X-Hermes-Voice-Session-Id": "session-123",
+                        "X-Hermes-Voice-Turn-Id": "2",
+                    },
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "[DONE]" in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api agent task started trace_id=voice-session-123-turn-2" in log_text
+            assert "api agent task completed trace_id=voice-session-123-turn-2" in log_text
+            assert "voice_session_id=session-123" in log_text
+            assert "voice_turn_id=2" in log_text
+
+    @pytest.mark.asyncio
     async def test_stream_logs_chunk_and_completion_metrics(self, adapter, caplog):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:

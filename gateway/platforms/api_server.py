@@ -2910,7 +2910,7 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.info(
                 "api agent task started trace_id=%s session_id=%s voice_session_id=%s voice_turn_id=%s",
                 api_trace_id,
-                session_id,
+                _log_safe(session_id),
                 _log_safe(api_voice_session_id or ""),
                 _log_safe(api_voice_turn_id or ""),
             )
@@ -2955,7 +2955,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "api agent task completed trace_id=%s session_id=%s voice_session_id=%s "
                 "voice_turn_id=%s final_response_chars=%s",
                 api_trace_id,
-                session_id,
+                _log_safe(session_id),
                 _log_safe(api_voice_session_id or ""),
                 _log_safe(api_voice_turn_id or ""),
                 len(str(result.get("final_response", ""))) if isinstance(result, dict) else 0,
