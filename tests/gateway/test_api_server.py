@@ -2753,7 +2753,9 @@ class TestCORS:
                 },
             )
             assert resp.status == 200
-            assert "X-Hermes-Trace-Id" in resp.headers.get("Access-Control-Allow-Headers", "")
+            allow_headers = resp.headers.get("Access-Control-Allow-Headers", "")
+            assert "X-Hermes-Trace-Id" in allow_headers
+            assert "X-Hermes-Session-Id" in allow_headers
             expose_headers = resp.headers.get("Access-Control-Expose-Headers", "")
             assert "X-Hermes-Trace-Id" in expose_headers
             assert "X-Hermes-Session-Id" in expose_headers
