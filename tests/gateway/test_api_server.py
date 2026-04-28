@@ -245,6 +245,29 @@ class TestAdapterInit:
             "http://127.0.0.1:3000",
         )
 
+    def test_voice_mode_create_agent_disables_api_tools_and_uses_voice_iteration_limit(self, adapter, monkeypatch):
+        created = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                created.update(kwargs)
+
+        monkeypatch.setenv("HERMES_VOICE_MAX_ITERATIONS", "2")
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        with (
+            patch("run_agent.AIAgent", FakeAgent),
+            patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": ["files"]}}),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value={"files"}),
+            patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None),
+        ):
+            adapter._create_agent(voice_mode=True)
+
+        assert created["enabled_toolsets"] == []
+        assert created["max_iterations"] == 2
+
 
 # ---------------------------------------------------------------------------
 # Auth checking
@@ -2239,6 +2262,29 @@ class TestSessionIdHeader:
             ]
             assert call_kwargs["user_message"] == "new voice question"
             assert call_kwargs["memory_prefetch_char_limit"] == 1234
+            assert call_kwargs["voice_mode"] is True
+
+    @pytest.mark.asyncio
+    async def test_non_voice_mode_keeps_normal_agent_tools(self, adapter):
+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "normal question"}],
+                    },
+                )
+
+            assert resp.status == 200
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["memory_prefetch_char_limit"] is None
+            assert call_kwargs["voice_mode"] is False
 
     def test_voice_history_limit_defaults_invalid_and_clamps_to_zero(self, monkeypatch):
         monkeypatch.delenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", raising=False)

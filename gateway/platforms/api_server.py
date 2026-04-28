@@ -711,6 +711,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         memory_prefetch_char_limit: Optional[int] = None,
+        voice_mode: bool = False,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -731,10 +732,13 @@ class APIServerAdapter(BasePlatformAdapter):
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         model = _resolve_gateway_model()
 
-        user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
-
-        max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+        if voice_mode:
+            enabled_toolsets = []
+            max_iterations = int(os.getenv("HERMES_VOICE_MAX_ITERATIONS", "2"))
+        else:
+            user_config = _load_gateway_config()
+            enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -983,6 +987,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 memory_prefetch_char_limit=memory_prefetch_char_limit,
+                voice_mode=is_voice_mode,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
                 agent_ref=agent_ref,
@@ -1001,6 +1006,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 memory_prefetch_char_limit=memory_prefetch_char_limit,
+                voice_mode=is_voice_mode,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2182,6 +2188,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         memory_prefetch_char_limit: Optional[int] = None,
+        voice_mode: bool = False,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -2206,6 +2213,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
                 memory_prefetch_char_limit=memory_prefetch_char_limit,
+                voice_mode=voice_mode,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
