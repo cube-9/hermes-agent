@@ -64,6 +64,49 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+TRACE_HEADER = "X-Hermes-Trace-Id"
+
+
+def _new_api_trace_id() -> str:
+    """Generate a compact request trace id for API caller postmortems."""
+    return f"api-{uuid.uuid4().hex}"
+
+
+def _request_trace_id(request: "web.Request") -> str:
+    """Return a caller-provided trace id, sanitized for logs/headers."""
+    raw_trace_id = request.headers.get(TRACE_HEADER, "").strip()
+    if not raw_trace_id:
+        return _new_api_trace_id()
+    return re.sub(r"[^A-Za-z0-9_.:-]", "-", raw_trace_id)[:128] or _new_api_trace_id()
+
+
+def _messages_summary(messages: List[Any]) -> Dict[str, Any]:
+    """Summarize chat messages for one-line request logging."""
+    roles: List[str] = []
+    user_chars = 0
+    assistant_chars = 0
+    system_chars = 0
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role", ""))
+        roles.append(role)
+        content_length = len(_normalize_chat_content(msg.get("content", "")))
+        if role == "user":
+            user_chars += content_length
+        elif role == "assistant":
+            assistant_chars += content_length
+        elif role == "system":
+            system_chars += content_length
+
+    return {
+        "count": len(messages),
+        "roles": ",".join(roles[-8:]),
+        "user_chars": user_chars,
+        "assistant_chars": assistant_chars,
+        "system_chars": system_chars,
+    }
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -984,6 +1027,7 @@ class APIServerAdapter(BasePlatformAdapter):
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
+        trace_id = _request_trace_id(request)
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
             return web.json_response(
@@ -1092,6 +1136,24 @@ class APIServerAdapter(BasePlatformAdapter):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
+        messages_summary = _messages_summary(messages)
+
+        logger.info(
+            "api request started trace_id=%s endpoint=/v1/chat/completions "
+            "completion_id=%s session_id=%s model=%s stream=%s voice_mode=%s "
+            "message_count=%s roles=%s user_chars=%s assistant_chars=%s system_chars=%s",
+            trace_id,
+            completion_id,
+            session_id,
+            model_name,
+            stream,
+            is_voice_mode,
+            messages_summary["count"],
+            messages_summary["roles"],
+            messages_summary["user_chars"],
+            messages_summary["assistant_chars"],
+            messages_summary["system_chars"],
+        )
 
         if stream:
             import queue as _q
@@ -1183,6 +1245,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                trace_id=trace_id,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -1236,6 +1299,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         response_headers = {
             "X-Hermes-Session-Id": result.get("session_id", session_id),
+            TRACE_HEADER: trace_id,
         }
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -1301,6 +1365,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None,
+        trace_id: str = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -1325,6 +1390,8 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Id"] = session_id
         if gateway_session_key:
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
+        if trace_id:
+            sse_headers[TRACE_HEADER] = trace_id
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
 

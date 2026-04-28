@@ -14,6 +14,7 @@ Tests cover:
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -641,6 +642,63 @@ class TestCapabilitiesEndpoint:
 
 
 class TestChatCompletionsEndpoint:
+    @pytest.mark.asyncio
+    async def test_chat_completion_accepts_voice_trace_header(self, adapter, caplog):
+        """Voice callers can provide a trace id that appears in logs and response headers."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Trace-Id": "voice-session-123"},
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+
+            assert resp.status == 200
+            assert resp.headers["X-Hermes-Trace-Id"] == "voice-session-123"
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api request started" in log_text
+            assert "trace_id=voice-session-123" in log_text
+            assert "endpoint=/v1/chat/completions" in log_text
+            assert "stream=False" in log_text
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_generates_trace_header_when_missing(self, adapter):
+        """Non-voice callers still get a generated trace id for postmortem debugging."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+
+            assert resp.status == 200
+            trace_id = resp.headers["X-Hermes-Trace-Id"]
+            assert trace_id.startswith("api-")
+            assert len(trace_id) >= 16
+
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)
