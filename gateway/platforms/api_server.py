@@ -732,13 +732,9 @@ class APIServerAdapter(BasePlatformAdapter):
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         model = _resolve_gateway_model()
 
-        if voice_mode:
-            enabled_toolsets = []
-            max_iterations = int(os.getenv("HERMES_VOICE_MAX_ITERATIONS", "2"))
-        else:
-            user_config = _load_gateway_config()
-            enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
-            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+        user_config = _load_gateway_config()
+        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -921,12 +917,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # history already set from request body above
 
         is_voice_mode = _is_voice_mode_chat_request(messages)
-        history = _limit_voice_history(history, messages)
-        memory_prefetch_char_limit = (
-            _voice_memory_prefetch_char_limit()
-            if is_voice_mode
-            else None
-        )
+        memory_prefetch_char_limit = None
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
