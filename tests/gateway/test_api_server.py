@@ -823,6 +823,122 @@ class TestChatCompletionsEndpoint:
             assert "final_response_chars=5" in log_text
 
     @pytest.mark.asyncio
+    async def test_voice_stream_times_out_when_no_first_text_delta(self, adapter, caplog, monkeypatch):
+        monkeypatch.setenv("HERMES_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS", "0.05")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                await asyncio.sleep(5)
+                return (
+                    {"final_response": "late answer", "messages": [], "api_calls": 1},
+                    {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.WARNING, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Trace-Id": "voice-timeout-test",
+                        "X-Hermes-Voice-Session-Id": "session-timeout-test",
+                        "X-Hermes-Voice-Turn-Id": "5",
+                    },
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "Which article should we discuss next?"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "event: error" in body
+            assert "first assistant text" in body
+            assert "[DONE]" in body
+            assert self._streamed_chat_delta_text(body) == ""
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream first_text_timeout trace_id=voice-timeout-test" in log_text
+            assert "voice_session_id=session-timeout-test" in log_text
+            assert "voice_turn_id=5" in log_text
+
+    @pytest.mark.asyncio
+    async def test_voice_stream_quiet_completion_keeps_zero_body_behavior(self, adapter, caplog, monkeypatch):
+        monkeypatch.setenv("HERMES_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS", "0.05")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                await asyncio.sleep(0.01)
+                return (
+                    {"final_response": "", "messages": [], "api_calls": 1},
+                    {"input_tokens": 2, "output_tokens": 0, "total_tokens": 2},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.WARNING, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Trace-Id": "voice-quiet-complete-test",
+                        "X-Hermes-Voice-Session-Id": "session-quiet-complete-test",
+                        "X-Hermes-Voice-Turn-Id": "6",
+                    },
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "[DONE]" in body
+            assert "event: error" not in body
+            assert self._streamed_chat_delta_text(body) == ""
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream zero body trace_id=voice-quiet-complete-test" in log_text
+            assert "api stream first_text_timeout" not in log_text
+
+    @pytest.mark.asyncio
+    async def test_non_voice_stream_keeps_existing_quiet_stream_behavior(self, adapter, caplog, monkeypatch):
+        monkeypatch.setenv("HERMES_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS", "0.05")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                await asyncio.sleep(0.08)
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("late non voice text")
+                return (
+                    {"final_response": "late non voice text", "messages": [], "api_calls": 1},
+                    {"input_tokens": 2, "output_tokens": 4, "total_tokens": 6},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Trace-Id": "non-voice-no-timeout"},
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert self._streamed_chat_delta_text(body) == "late non voice text"
+            assert "event: error" not in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream first_text_timeout" not in log_text
+
+    @pytest.mark.asyncio
     async def test_stream_logs_zero_body_warning(self, adapter, caplog):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:

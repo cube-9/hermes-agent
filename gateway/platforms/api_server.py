@@ -63,6 +63,12 @@ MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 TRACE_HEADER = "X-Hermes-Trace-Id"
 VOICE_SESSION_HEADER = "X-Hermes-Voice-Session-Id"
 VOICE_TURN_HEADER = "X-Hermes-Voice-Turn-Id"
+VOICE_FIRST_TEXT_DELTA_TIMEOUT_ENV = "HERMES_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS"
+DEFAULT_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS = 90.0
+VOICE_FIRST_TEXT_TIMEOUT_MESSAGE = (
+    "Hermes is still working but did not produce assistant text in time. "
+    "Please try again."
+)
 
 
 def _new_api_trace_id() -> str:
@@ -76,6 +82,24 @@ def _request_trace_id(request: "web.Request") -> str:
     if not raw_trace_id:
         return _new_api_trace_id()
     return re.sub(r"[^A-Za-z0-9_.:-]", "-", raw_trace_id)[:128] or _new_api_trace_id()
+
+
+def _voice_first_text_delta_timeout_seconds() -> float:
+    raw_value = os.getenv(
+        VOICE_FIRST_TEXT_DELTA_TIMEOUT_ENV,
+        str(DEFAULT_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS),
+    )
+    try:
+        timeout = float(raw_value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "invalid %s=%r; using default %.1fs",
+            VOICE_FIRST_TEXT_DELTA_TIMEOUT_ENV,
+            raw_value,
+            DEFAULT_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS
+    return max(0.0, timeout)
 
 
 def _log_safe(value: Any, *, max_length: int = 128) -> str:
@@ -1226,12 +1250,87 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 return time.monotonic()
 
+            async def _emit_error_event(message: str, error_type: str) -> None:
+                error = {
+                    "message": message,
+                    "type": error_type,
+                }
+                if error_type == "first_text_timeout":
+                    error["reason"] = "first assistant text timeout"
+                error_event = {
+                    "error": error,
+                    "trace_id": trace_id,
+                    "completion_id": completion_id,
+                    "session_id": safe_session_id,
+                    "voice_session_id": _log_safe(voice_session_id),
+                    "voice_turn_id": _log_safe(voice_turn_id),
+                }
+                await response.write(f"event: error\ndata: {json.dumps(error_event)}\n\n".encode())
+
+            voice_first_text_timeout_seconds = _voice_first_text_delta_timeout_seconds()
+            enforce_voice_first_text_timeout = bool(voice_session_id or voice_turn_id)
+            first_text_deadline = (
+                stream_started + voice_first_text_timeout_seconds
+                if enforce_voice_first_text_timeout and voice_first_text_timeout_seconds > 0
+                else None
+            )
+            voice_first_text_timed_out = False
+
             # Stream content chunks as they arrive from the agent
             loop = asyncio.get_running_loop()
             while True:
+                queue_wait_timeout = 0.5
+                if first_text_delta_at is None and first_text_deadline is not None:
+                    queue_wait_timeout = max(0.0, min(queue_wait_timeout, first_text_deadline - time.monotonic()))
                 try:
-                    delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
+                    delta = await loop.run_in_executor(
+                        None,
+                        lambda: stream_q.get(timeout=queue_wait_timeout),
+                    )
                 except _q.Empty:
+                    if (
+                        first_text_delta_at is None
+                        and first_text_deadline is not None
+                        and time.monotonic() >= first_text_deadline
+                        and not agent_task.done()
+                    ):
+                        elapsed_ms = int((time.monotonic() - stream_started) * 1000)
+                        logger.warning(
+                            "api stream first_text_timeout trace_id=%s completion_id=%s session_id=%s "
+                            "voice_session_id=%s voice_turn_id=%s elapsed_ms=%s timeout_secs=%s "
+                            "text_chunks=%s text_chars=%s keepalives=%s tool_progress_events=%s",
+                            trace_id,
+                            completion_id,
+                            safe_session_id,
+                            _log_safe(voice_session_id),
+                            _log_safe(voice_turn_id),
+                            elapsed_ms,
+                            voice_first_text_timeout_seconds,
+                            text_chunks,
+                            text_chars,
+                            keepalive_count,
+                            tool_progress_events,
+                        )
+                        agent = agent_ref[0] if agent_ref else None
+                        if agent is not None:
+                            try:
+                                agent.interrupt("voice first assistant text timeout")
+                            except Exception:
+                                pass
+                        if not agent_task.done():
+                            agent_task.cancel()
+                            try:
+                                await agent_task
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception:
+                                pass
+                        await _emit_error_event(
+                            VOICE_FIRST_TEXT_TIMEOUT_MESSAGE,
+                            "first_text_timeout",
+                        )
+                        voice_first_text_timed_out = True
+                        break
                     if agent_task.done():
                         # Drain any remaining items
                         while True:
@@ -1253,6 +1352,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
 
                 last_activity = await _emit(delta)
+
+            if voice_first_text_timed_out:
+                await response.write(b"data: [DONE]\n\n")
+                return response
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -1282,16 +1385,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_events,
                     e,
                 )
-                error_event = {
-                    "error": {
-                        "message": str(e),
-                        "type": "server_error",
-                    },
-                    "trace_id": trace_id,
-                    "completion_id": completion_id,
-                    "session_id": safe_session_id,
-                }
-                await response.write(f"event: error\ndata: {json.dumps(error_event)}\n\n".encode())
+                await _emit_error_event(str(e), "server_error")
 
             if agent_error is not None:
                 return response
