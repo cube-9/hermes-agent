@@ -3010,25 +3010,91 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         def _run():
-            agent = self._create_agent(
-                ephemeral_system_prompt=ephemeral_system_prompt,
-                session_id=session_id,
-                memory_prefetch_char_limit=memory_prefetch_char_limit,
-                voice_mode=voice_mode,
-                stream_delta_callback=stream_delta_callback,
-                tool_progress_callback=tool_progress_callback,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
-                gateway_session_key=gateway_session_key,
-            )
+            create_started = time.monotonic()
+            if api_trace_id:
+                logger.info(
+                    "api agent create started trace_id=%s session_id=%s voice_session_id=%s "
+                    "voice_turn_id=%s voice_mode=%s history_messages=%s user_chars=%s",
+                    api_trace_id,
+                    _log_safe(session_id),
+                    _log_safe(api_voice_session_id or ""),
+                    _log_safe(api_voice_turn_id or ""),
+                    voice_mode,
+                    len(conversation_history),
+                    len(str(user_message)),
+                )
+            try:
+                agent = self._create_agent(
+                    ephemeral_system_prompt=ephemeral_system_prompt,
+                    session_id=session_id,
+                    memory_prefetch_char_limit=memory_prefetch_char_limit,
+                    voice_mode=voice_mode,
+                    stream_delta_callback=stream_delta_callback,
+                    tool_progress_callback=tool_progress_callback,
+                    tool_start_callback=tool_start_callback,
+                    tool_complete_callback=tool_complete_callback,
+                    gateway_session_key=gateway_session_key,
+                )
+            except Exception:
+                if api_trace_id:
+                    logger.exception(
+                        "api agent create failed trace_id=%s session_id=%s voice_session_id=%s "
+                        "voice_turn_id=%s elapsed_ms=%s",
+                        api_trace_id,
+                        _log_safe(session_id),
+                        _log_safe(api_voice_session_id or ""),
+                        _log_safe(api_voice_turn_id or ""),
+                        int((time.monotonic() - create_started) * 1000),
+                    )
+                raise
+
+            if api_trace_id:
+                logger.info(
+                    "api agent create completed trace_id=%s session_id=%s voice_session_id=%s "
+                    "voice_turn_id=%s elapsed_ms=%s agent_class=%s",
+                    api_trace_id,
+                    _log_safe(session_id),
+                    _log_safe(api_voice_session_id or ""),
+                    _log_safe(api_voice_turn_id or ""),
+                    int((time.monotonic() - create_started) * 1000),
+                    agent.__class__.__name__,
+                )
+
             if agent_ref is not None:
                 agent_ref[0] = agent
+
+            run_started = time.monotonic()
+            if api_trace_id:
+                logger.info(
+                    "api agent run_conversation started trace_id=%s session_id=%s "
+                    "voice_session_id=%s voice_turn_id=%s history_messages=%s user_chars=%s",
+                    api_trace_id,
+                    _log_safe(session_id),
+                    _log_safe(api_voice_session_id or ""),
+                    _log_safe(api_voice_turn_id or ""),
+                    len(conversation_history),
+                    len(str(user_message)),
+                )
             effective_task_id = session_id or str(uuid.uuid4())
-            result = agent.run_conversation(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                task_id=effective_task_id,
-            )
+            try:
+                result = agent.run_conversation(
+                    user_message=user_message,
+                    conversation_history=conversation_history,
+                    task_id=effective_task_id,
+                )
+            except Exception:
+                if api_trace_id:
+                    logger.exception(
+                        "api agent run_conversation failed trace_id=%s session_id=%s "
+                        "voice_session_id=%s voice_turn_id=%s elapsed_ms=%s",
+                        api_trace_id,
+                        _log_safe(session_id),
+                        _log_safe(api_voice_session_id or ""),
+                        _log_safe(api_voice_turn_id or ""),
+                        int((time.monotonic() - run_started) * 1000),
+                    )
+                raise
+
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                 "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -3040,6 +3106,21 @@ class APIServerAdapter(BasePlatformAdapter):
             _eff_sid = getattr(agent, "session_id", session_id)
             if isinstance(_eff_sid, str) and _eff_sid:
                 result["session_id"] = _eff_sid
+            if api_trace_id:
+                logger.info(
+                    "api agent run_conversation completed trace_id=%s session_id=%s "
+                    "voice_session_id=%s voice_turn_id=%s elapsed_ms=%s final_response_chars=%s "
+                    "input_tokens=%s output_tokens=%s total_tokens=%s",
+                    api_trace_id,
+                    _log_safe(session_id),
+                    _log_safe(api_voice_session_id or ""),
+                    _log_safe(api_voice_turn_id or ""),
+                    int((time.monotonic() - run_started) * 1000),
+                    len(str(result.get("final_response", ""))) if isinstance(result, dict) else 0,
+                    usage["input_tokens"],
+                    usage["output_tokens"],
+                    usage["total_tokens"],
+                )
             return result, usage
 
         result_tuple = await loop.run_in_executor(None, _run)

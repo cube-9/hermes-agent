@@ -869,9 +869,77 @@ class TestChatCompletionsEndpoint:
             assert "[DONE]" in body
             log_text = "\n".join(record.getMessage() for record in caplog.records)
             assert "api agent task started trace_id=voice-session-123-turn-2" in log_text
+            assert "api agent create started trace_id=voice-session-123-turn-2" in log_text
+            assert "api agent create completed trace_id=voice-session-123-turn-2" in log_text
+            assert "api agent run_conversation started trace_id=voice-session-123-turn-2" in log_text
+            assert "api agent run_conversation completed trace_id=voice-session-123-turn-2" in log_text
             assert "api agent task completed trace_id=voice-session-123-turn-2" in log_text
             assert "voice_session_id=session-123" in log_text
             assert "voice_turn_id=2" in log_text
+
+    @pytest.mark.asyncio
+    async def test_streaming_voice_trace_logs_agent_create_failure(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_create_agent", side_effect=RuntimeError("create boom")),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Trace-Id": "voice-create-failure",
+                        "X-Hermes-Voice-Session-Id": "session-create-failure",
+                        "X-Hermes-Voice-Turn-Id": "3",
+                    },
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "event: error" in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api agent create started trace_id=voice-create-failure" in log_text
+            assert "api agent create failed trace_id=voice-create-failure" in log_text
+            assert "api agent run_conversation started trace_id=voice-create-failure" not in log_text
+
+    @pytest.mark.asyncio
+    async def test_streaming_voice_trace_logs_run_conversation_failure(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.side_effect = RuntimeError("run boom")
+
+            with (
+                patch.object(adapter, "_create_agent", return_value=mock_agent),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Trace-Id": "voice-run-failure",
+                        "X-Hermes-Voice-Session-Id": "session-run-failure",
+                        "X-Hermes-Voice-Turn-Id": "4",
+                    },
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "event: error" in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api agent create completed trace_id=voice-run-failure" in log_text
+            assert "api agent run_conversation started trace_id=voice-run-failure" in log_text
+            assert "api agent run_conversation failed trace_id=voice-run-failure" in log_text
+            assert "api agent run_conversation completed trace_id=voice-run-failure" not in log_text
 
     @pytest.mark.asyncio
     async def test_stream_logs_chunk_and_completion_metrics(self, adapter, caplog):
