@@ -381,6 +381,10 @@ class _CodexCompletionsAdapter:
             "store": False,
         }
 
+        request_timeout = kwargs.get("timeout")
+        if request_timeout is not None:
+            resp_kwargs["timeout"] = request_timeout
+
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
         # support max_output_tokens or temperature — omit to avoid 400 errors.
 

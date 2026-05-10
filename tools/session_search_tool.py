@@ -19,6 +19,7 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import math
 import re
 from typing import Dict, Any, List, Optional, Union
 
@@ -46,6 +47,29 @@ def _get_session_search_max_concurrency(default: int = 3) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, min(value, 5))
+
+
+def _get_session_search_timeout(default: float = 30.0) -> float:
+    """Read auxiliary.session_search.timeout with a positive finite fallback."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+    except ImportError:
+        return default
+    aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
+    task_config = aux.get("session_search", {}) if isinstance(aux, dict) else {}
+    if not isinstance(task_config, dict):
+        return default
+    raw = task_config.get("timeout")
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if value <= 0 or not math.isfinite(value):
+        return default
+    return value
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -194,7 +218,11 @@ def _truncate_around_matches(
 
 
 async def _summarize_session(
-    conversation_text: str, query: str, session_meta: Dict[str, Any]
+    conversation_text: str,
+    query: str,
+    session_meta: Dict[str, Any],
+    *,
+    timeout: Optional[float] = None,
 ) -> Optional[str]:
     """Summarize a single session conversation focused on the search query."""
     system_prompt = (
@@ -231,6 +259,7 @@ async def _summarize_session(
                 ],
                 temperature=0.1,
                 max_tokens=MAX_SUMMARY_TOKENS,
+                timeout=timeout,
             )
             content = extract_content_or_reasoning(response)
             if content:
@@ -443,6 +472,8 @@ def session_search(
                 )
 
         # Summarize all sessions in parallel
+        timeout_seconds = _get_session_search_timeout()
+
         async def _summarize_all() -> List[Union[str, Exception]]:
             """Summarize all sessions with bounded concurrency."""
             max_concurrency = min(_get_session_search_max_concurrency(), max(1, len(tasks)))
@@ -450,13 +481,18 @@ def session_search(
 
             async def _bounded_summary(text: str, meta: Dict[str, Any]) -> Optional[str]:
                 async with semaphore:
-                    return await _summarize_session(text, query, meta)
+                    return await _summarize_session(
+                        text, query, meta, timeout=timeout_seconds
+                    )
 
             coros = [
                 _bounded_summary(text, meta)
                 for _, _, text, meta in tasks
             ]
-            return await asyncio.gather(*coros, return_exceptions=True)
+            return await asyncio.wait_for(
+                asyncio.gather(*coros, return_exceptions=True),
+                timeout=timeout_seconds,
+            )
 
         try:
             # Use _run_async() which properly manages event loops across
@@ -467,14 +503,21 @@ def session_search(
             # causing deadlocks in gateway mode (#2681).
             from model_tools import _run_async
             results = _run_async(_summarize_all())
-        except concurrent.futures.TimeoutError:
+        except (TimeoutError, concurrent.futures.TimeoutError):
             logging.warning(
-                "Session summarization timed out after 60 seconds",
+                "Session summarization timed out after %.2f seconds",
+                timeout_seconds,
                 exc_info=True,
             )
             return json.dumps({
                 "success": False,
-                "error": "Session summarization timed out. Try a more specific query or reduce the limit.",
+                "query": query,
+                "error": (
+                    "Session summarization timed out after "
+                    f"{timeout_seconds:g} seconds. Try a more specific query or reduce the limit."
+                ),
+                "timeout_seconds": timeout_seconds,
+                "sessions_prepared": len(tasks),
             }, ensure_ascii=False)
 
         summaries = []
