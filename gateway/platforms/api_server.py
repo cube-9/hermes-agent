@@ -65,6 +65,7 @@ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 TRACE_HEADER = "X-Hermes-Trace-Id"
+STATELESS_HEADER = "X-Hermes-Stateless"
 VOICE_SESSION_HEADER = "X-Hermes-Voice-Session-Id"
 VOICE_TURN_HEADER = "X-Hermes-Voice-Turn-Id"
 VOICE_FIRST_TEXT_DELTA_TIMEOUT_ENV = "HERMES_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS"
@@ -86,6 +87,10 @@ def _request_trace_id(request: "web.Request") -> str:
     if not raw_trace_id:
         return _new_api_trace_id()
     return re.sub(r"[^A-Za-z0-9_.:-]", "-", raw_trace_id)[:128] or _new_api_trace_id()
+
+
+def _truthy_header(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _voice_first_text_delta_timeout_seconds() -> float:
@@ -483,7 +488,10 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": f"Authorization, Content-Type, Idempotency-Key, {TRACE_HEADER}, X-Hermes-Session-Id",
+    "Access-Control-Allow-Headers": (
+        f"Authorization, Content-Type, Idempotency-Key, {TRACE_HEADER}, "
+        f"X-Hermes-Session-Id, {STATELESS_HEADER}"
+    ),
     "Access-Control-Expose-Headers": f"{TRACE_HEADER}, X-Hermes-Session-Id",
 }
 
@@ -1108,6 +1116,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        stateless_requested = _truthy_header(request.headers.get(STATELESS_HEADER, ""))
+
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This
         # is independent of X-Hermes-Session-Id: the key persists across
@@ -1125,7 +1135,20 @@ class APIServerAdapter(BasePlatformAdapter):
         # authenticated.  Without this gate, any unauthenticated client could
         # read arbitrary session history by guessing/enumerating session IDs.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
-        if provided_session_id:
+        if stateless_requested and provided_session_id:
+            return web.json_response(
+                _openai_error(
+                    f"{STATELESS_HEADER} cannot be combined with X-Hermes-Session-Id.",
+                    code="invalid_request",
+                ),
+                status=400,
+            )
+        if stateless_requested:
+            # Diagnostic replay mode: keep the exact OpenAI request-body history,
+            # but isolate persistence under a fresh Hermes session so repeated
+            # provider repro samples do not accumulate state.
+            session_id = f"api-stateless-{uuid.uuid4().hex[:16]}"
+        elif provided_session_id:
             if not self._api_key:
                 logger.warning(
                     "Session continuation via X-Hermes-Session-Id rejected: "
@@ -1177,7 +1200,7 @@ class APIServerAdapter(BasePlatformAdapter):
         logger.info(
             "api request started trace_id=%s endpoint=/v1/chat/completions "
             "completion_id=%s session_id=%s model=%s stream=%s voice_mode=%s "
-            "voice_session_id=%s voice_turn_id=%s "
+            "stateless=%s voice_session_id=%s voice_turn_id=%s "
             "message_count=%s roles=%s user_chars=%s assistant_chars=%s system_chars=%s",
             trace_id,
             completion_id,
@@ -1185,6 +1208,7 @@ class APIServerAdapter(BasePlatformAdapter):
             _log_safe(model_name),
             stream,
             is_voice_mode,
+            stateless_requested,
             _log_safe(voice_session_id),
             _log_safe(voice_turn_id),
             messages_summary["count"],

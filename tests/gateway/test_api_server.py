@@ -29,6 +29,7 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _IdempotencyCache,
     _CORS_HEADERS,
+    STATELESS_HEADER,
     _derive_chat_session_id,
     _log_safe,
     check_api_server_requirements,
@@ -3178,6 +3179,7 @@ class TestCORS:
             allow_headers = resp.headers.get("Access-Control-Allow-Headers", "")
             assert "X-Hermes-Trace-Id" in allow_headers
             assert "X-Hermes-Session-Id" in allow_headers
+            assert STATELESS_HEADER in allow_headers
             expose_headers = resp.headers.get("Access-Control-Expose-Headers", "")
             assert "X-Hermes-Trace-Id" in expose_headers
             assert "X-Hermes-Session-Id" in expose_headers
@@ -3578,6 +3580,73 @@ class TestSessionIdHeader:
             assert call_kwargs["conversation_history"] == []
             assert call_kwargs["session_id"] == "some-session"
 
+    @pytest.mark.asyncio
+    async def test_stateless_header_uses_request_history_and_unique_session(self, auth_adapter):
+        """Diagnostic replays can avoid accumulated Hermes session state."""
+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "stored message"},
+            {"role": "assistant", "content": "stored reply"},
+        ]
+        auth_adapter._session_db = mock_db
+
+        app = _create_app(auth_adapter)
+        body = {
+            "model": "hermes-agent",
+            "messages": [
+                {"role": "user", "content": "request message 1"},
+                {"role": "assistant", "content": "request reply 1"},
+                {"role": "user", "content": "new question"},
+            ],
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+                first_resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={STATELESS_HEADER: "1", "Authorization": "Bearer sk-secret"},
+                    json=body,
+                )
+                second_resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={STATELESS_HEADER: "1", "Authorization": "Bearer sk-secret"},
+                    json=body,
+                )
+
+        assert first_resp.status == 200
+        assert second_resp.status == 200
+        assert first_resp.headers["X-Hermes-Session-Id"] != second_resp.headers["X-Hermes-Session-Id"]
+        assert mock_db.get_messages_as_conversation.call_count == 0
+
+        first_call = mock_run.call_args_list[0].kwargs
+        second_call = mock_run.call_args_list[1].kwargs
+        assert first_call["conversation_history"] == [
+            {"role": "user", "content": "request message 1"},
+            {"role": "assistant", "content": "request reply 1"},
+        ]
+        assert first_call["user_message"] == "new question"
+        assert first_call["session_id"].startswith("api-stateless-")
+        assert second_call["session_id"].startswith("api-stateless-")
+        assert first_call["session_id"] != second_call["session_id"]
+
+    @pytest.mark.asyncio
+    async def test_stateless_header_conflicts_with_session_continuation(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                headers={
+                    STATELESS_HEADER: "1",
+                    "X-Hermes-Session-Id": "existing-session",
+                    "Authorization": "Bearer sk-secret",
+                },
+                json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+
+        assert resp.status == 400
 
 # ---------------------------------------------------------------------------
 # X-Hermes-Session-Key header (long-term memory scoping)
