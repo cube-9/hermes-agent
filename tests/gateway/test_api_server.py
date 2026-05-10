@@ -15,6 +15,7 @@ Tests cover:
 import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -195,6 +196,38 @@ class TestIdempotencyCache:
         gate.set()
         assert await second == "response"
 
+    @pytest.mark.asyncio
+    async def test_cancelled_waiter_can_cancel_owned_inflight_task(self):
+        cache = _IdempotencyCache()
+        gate = asyncio.Event()
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def compute():
+            started.set()
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return "response"
+
+        first = asyncio.create_task(
+            cache.get_or_set(
+                "idem-key",
+                "fp-1",
+                compute,
+                cancel_inflight_on_waiter_cancel=True,
+            )
+        )
+
+        await started.wait()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        assert cancelled.is_set()
+
 
 # ---------------------------------------------------------------------------
 # Adapter initialization
@@ -372,6 +405,171 @@ class TestAdapterInit:
             adapter._create_agent(voice_mode=False)
 
         assert created["enabled_toolsets"] == ["files", "session_search", "skills"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_interrupts_agent_when_async_task_is_cancelled(adapter, monkeypatch):
+    created_agent = {}
+    entered_run = threading.Event()
+    release_run = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self, **kwargs):
+            self.interrupt_reason = None
+            created_agent["agent"] = self
+
+        def run_conversation(self, **kwargs):
+            entered_run.set()
+            while not release_run.is_set():
+                time.sleep(0.01)
+            return {"final_response": "late"}
+
+        def interrupt(self, reason):
+            self.interrupt_reason = reason
+            release_run.set()
+
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+    with (
+        patch("run_agent.AIAgent", FakeAgent),
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": []}}),
+        patch("hermes_cli.tools_config._get_platform_tools", return_value=set()),
+        patch("gateway.run.GatewayRunner._load_fallback_model", return_value={}),
+    ):
+        task = asyncio.create_task(
+            adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="cancel-test",
+                api_trace_id="cancel-trace",
+                agent_ref=[None],
+            )
+        )
+        assert await asyncio.to_thread(entered_run.wait, 1.0) is True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert created_agent["agent"].interrupt_reason == "api task cancelled"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_preserves_existing_interrupt_reason_when_cancelled(adapter, monkeypatch):
+    agent_ref = [None]
+    entered_run = threading.Event()
+    release_run = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self, **kwargs):
+            self._interrupt_requested = True
+            self.interrupt_reason = "SSE client disconnected"
+            self.interrupt_calls = []
+
+        def run_conversation(self, **kwargs):
+            entered_run.set()
+            release_run.wait(1.0)
+            return {"final_response": "late"}
+
+        def interrupt(self, reason):
+            self.interrupt_calls.append(reason)
+            self.interrupt_reason = reason
+
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+    with (
+        patch("run_agent.AIAgent", FakeAgent),
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": []}}),
+        patch("hermes_cli.tools_config._get_platform_tools", return_value=set()),
+        patch("gateway.run.GatewayRunner._load_fallback_model", return_value={}),
+    ):
+        task = asyncio.create_task(
+            adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="cancel-test",
+                api_trace_id="cancel-trace",
+                agent_ref=agent_ref,
+            )
+        )
+        assert await asyncio.to_thread(entered_run.wait, 1.0) is True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release_run.set()
+
+    agent = agent_ref[0]
+    assert agent.interrupt_calls == []
+    assert agent.interrupt_reason == "SSE client disconnected"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_intercepts_cancellation_before_agent_ref_is_published(adapter, monkeypatch):
+    create_started = threading.Event()
+    release_create = threading.Event()
+    created = {}
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self):
+            self.interrupt_reason = None
+            self.run_called = False
+            created["agent"] = self
+
+        def interrupt(self, reason):
+            self.interrupt_reason = reason
+
+        def run_conversation(self, **kwargs):
+            self.run_called = True
+            return {"final_response": "should not run"}
+
+    def fake_create_agent(**kwargs):
+        create_started.set()
+        release_create.wait(1.0)
+        return FakeAgent()
+
+    monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
+
+    agent_ref = [None]
+    task = asyncio.create_task(
+        adapter._run_agent(
+            user_message="hello",
+            conversation_history=[],
+            session_id="pre-ref-cancel-test",
+            api_trace_id="pre-ref-cancel-trace",
+            agent_ref=agent_ref,
+        )
+    )
+    assert await asyncio.to_thread(create_started.wait, 1.0) is True
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release_create.set()
+
+    for _ in range(100):
+        agent = created.get("agent")
+        if agent is not None and agent.interrupt_reason:
+            break
+        await asyncio.sleep(0.01)
+
+    agent = created["agent"]
+    assert agent_ref[0] is agent
+    assert agent.interrupt_reason == "api task cancelled"
+    assert agent.run_called is False
 
 
 # ---------------------------------------------------------------------------
@@ -3528,8 +3726,8 @@ class TestSessionIdHeader:
             assert call_kwargs["user_message"] == "new question"
 
     @pytest.mark.asyncio
-    async def test_voice_session_id_keeps_loaded_db_history(self, auth_adapter):
-        """Voice-mode requests keep DB-loaded history before passing it to the agent."""
+    async def test_voice_session_id_bounds_loaded_db_history(self, auth_adapter, monkeypatch):
+        """Voice-mode requests bound DB-loaded history before passing it to the agent."""
         mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
         db_history = [
             {"role": "user", "content": f"stored message {index}"}
@@ -3538,6 +3736,8 @@ class TestSessionIdHeader:
         mock_db = MagicMock()
         mock_db.get_messages_as_conversation.return_value = db_history
         auth_adapter._session_db = mock_db
+        monkeypatch.setenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", "3")
+        monkeypatch.setenv("HERMES_VOICE_MAX_MEMORY_PREFETCH_CHARS", "4321")
 
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -3561,13 +3761,16 @@ class TestSessionIdHeader:
 
             assert resp.status == 200
             call_kwargs = mock_run.call_args.kwargs
-            assert call_kwargs["conversation_history"] == db_history
+            assert call_kwargs["conversation_history"] == db_history[-3:]
             assert call_kwargs["user_message"] == "new voice question"
+            assert call_kwargs["memory_prefetch_char_limit"] == 4321
 
     @pytest.mark.asyncio
-    async def test_voice_mode_keeps_request_body_history_without_session_header(self, adapter):
-        """Voice-mode requests keep OpenAI request-body history on the Pipecat path."""
+    async def test_voice_mode_bounds_request_body_history_without_session_header(self, adapter, monkeypatch):
+        """Voice-mode requests bound OpenAI request-body history on the Pipecat path."""
         mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+        monkeypatch.setenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", "2")
+        monkeypatch.setenv("HERMES_VOICE_MAX_MEMORY_PREFETCH_CHARS", "9876")
 
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -3592,13 +3795,11 @@ class TestSessionIdHeader:
             assert resp.status == 200
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["conversation_history"] == [
-                {"role": "user", "content": "old question 1"},
-                {"role": "assistant", "content": "old answer 1"},
                 {"role": "user", "content": "old question 2"},
                 {"role": "assistant", "content": "old answer 2"},
             ]
             assert call_kwargs["user_message"] == "new voice question"
-            assert call_kwargs["memory_prefetch_char_limit"] is None
+            assert call_kwargs["memory_prefetch_char_limit"] == 9876
             assert call_kwargs["voice_mode"] is True
 
     @pytest.mark.asyncio
@@ -3622,6 +3823,58 @@ class TestSessionIdHeader:
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["memory_prefetch_char_limit"] is None
             assert call_kwargs["voice_mode"] is False
+
+    @pytest.mark.asyncio
+    async def test_idempotent_chat_completion_cancellation_interrupts_agent(self, adapter, monkeypatch):
+        request = MagicMock()
+        request.headers = {"Idempotency-Key": f"idem-{uuid.uuid4().hex}"}
+        request.json = AsyncMock(return_value={
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        entered_run = threading.Event()
+        release_run = threading.Event()
+        created_agent = {}
+
+        class FakeAgent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+
+            def __init__(self, **kwargs):
+                self.interrupt_reason = None
+                created_agent["agent"] = self
+
+            def run_conversation(self, **kwargs):
+                entered_run.set()
+                while not release_run.is_set():
+                    time.sleep(0.01)
+                return {"final_response": "late", "messages": [], "api_calls": 1}
+
+            def interrupt(self, reason):
+                self.interrupt_reason = reason
+                release_run.set()
+
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        with (
+            patch("run_agent.AIAgent", FakeAgent),
+            patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": []}}),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value=set()),
+            patch("gateway.run.GatewayRunner._load_fallback_model", return_value={}),
+        ):
+            task = asyncio.create_task(adapter._handle_chat_completions(request))
+            assert await asyncio.to_thread(entered_run.wait, 1.0) is True
+            task.cancel()
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                release_run.set()
+
+        assert created_agent["agent"].interrupt_reason == "api task cancelled"
 
     @pytest.mark.asyncio
     async def test_db_failure_falls_back_to_empty_history(self, auth_adapter):
