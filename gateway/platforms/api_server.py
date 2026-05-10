@@ -29,6 +29,7 @@ import os
 import socket as _socket
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -112,6 +113,28 @@ def _log_safe(value: Any, *, max_length: int = 128) -> str:
     text = str(value)
     safe = "".join(ch if ch.isprintable() and ch not in "\r\n\t" else "-" for ch in text)
     return safe[:max_length]
+
+
+def _interrupt_agent_ref(agent_ref: Optional[List[Any]], reason: str) -> None:
+    agent = agent_ref[0] if agent_ref else None
+    if agent is None:
+        return
+    try:
+        if getattr(agent, "_interrupt_requested", False) is True:
+            return
+        agent.interrupt(reason)
+    except Exception:
+        pass
+
+
+async def _cancel_stream_agent_task(agent_task, agent_ref: Optional[List[Any]], reason: str) -> None:
+    _interrupt_agent_ref(agent_ref, reason)
+    if not agent_task.done():
+        agent_task.cancel()
+        try:
+            await agent_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 def _messages_summary(messages: List[Any]) -> Dict[str, Any]:
@@ -1222,9 +1245,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if trace_id:
             sse_headers[TRACE_HEADER] = trace_id
         response = web.StreamResponse(status=200, headers=sse_headers)
-        await response.prepare(request)
 
         try:
+            await response.prepare(request)
             last_activity = time.monotonic()
             stream_started = last_activity
             first_text_delta_at = None
@@ -1471,22 +1494,23 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
+        except asyncio.CancelledError:
+            await _cancel_stream_agent_task(agent_task, agent_ref, "SSE client disconnected")
+            logger.info(
+                "SSE stream cancelled; interrupted agent task %s trace_id=%s session_id=%s "
+                "voice_session_id=%s voice_turn_id=%s",
+                completion_id,
+                trace_id,
+                _log_safe(session_id),
+                _log_safe(voice_session_id),
+                _log_safe(voice_turn_id),
+            )
+            raise
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected mid-stream.  Interrupt the agent so it
             # stops making LLM API calls at the next loop iteration, then
             # cancel the asyncio task wrapper.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    agent.interrupt("SSE client disconnected")
-                except Exception:
-                    pass
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await _cancel_stream_agent_task(agent_task, agent_ref, "SSE client disconnected")
             logger.info(
                 "SSE client disconnected; interrupted agent task %s trace_id=%s session_id=%s "
                 "voice_session_id=%s voice_turn_id=%s",
@@ -1555,7 +1579,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if session_id:
             sse_headers["X-Hermes-Session-Id"] = session_id
         response = web.StreamResponse(status=200, headers=sse_headers)
-        await response.prepare(request)
 
         # State accumulated during the stream
         final_text_parts: List[str] = []
@@ -1603,6 +1626,7 @@ class APIServerAdapter(BasePlatformAdapter):
         usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
         try:
+            await response.prepare(request)
             # response.created — initial envelope, status=in_progress
             created_env = _envelope("in_progress")
             created_env["output"] = []
@@ -1901,21 +1925,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     if conversation:
                         self._response_store.set_conversation(conversation, response_id)
 
+        except asyncio.CancelledError:
+            await _cancel_stream_agent_task(agent_task, agent_ref, "SSE client disconnected")
+            logger.info("SSE stream cancelled; interrupted agent task %s", response_id)
+            raise
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected — interrupt the agent so it stops
             # making upstream LLM calls, then cancel the task.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    agent.interrupt("SSE client disconnected")
-                except Exception:
-                    pass
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await _cancel_stream_agent_task(agent_task, agent_ref, "SSE client disconnected")
             logger.info("SSE client disconnected; interrupted agent task %s", response_id)
 
         return response
@@ -2519,6 +2536,7 @@ class APIServerAdapter(BasePlatformAdapter):
         another thread to stop in-progress LLM calls.
         """
         loop = asyncio.get_running_loop()
+        cancel_requested = threading.Event()
         if api_trace_id:
             logger.info(
                 "api agent task started trace_id=%s session_id=%s voice_session_id=%s voice_turn_id=%s",
@@ -2580,6 +2598,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
             if agent_ref is not None:
                 agent_ref[0] = agent
+            if cancel_requested.is_set():
+                try:
+                    already_interrupted = getattr(agent, "_interrupt_requested", False) is True
+                    if not already_interrupted:
+                        agent.interrupt("api task cancelled")
+                except Exception:
+                    pass
+                return {"final_response": "", "error": "api task cancelled"}, {
+                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                }
 
             run_started = time.monotonic()
             if api_trace_id:
@@ -2634,7 +2664,28 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             return result, usage
 
-        result_tuple = await loop.run_in_executor(None, _run)
+        executor_future = loop.run_in_executor(None, _run)
+        try:
+            result_tuple = await executor_future
+        except asyncio.CancelledError:
+            cancel_requested.set()
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                try:
+                    already_interrupted = getattr(agent, "_interrupt_requested", False) is True
+                    if not already_interrupted:
+                        agent.interrupt("api task cancelled")
+                except Exception:
+                    pass
+            if api_trace_id:
+                logger.info(
+                    "api agent task cancelled trace_id=%s session_id=%s voice_session_id=%s voice_turn_id=%s",
+                    api_trace_id,
+                    _log_safe(session_id),
+                    _log_safe(api_voice_session_id or ""),
+                    _log_safe(api_voice_turn_id or ""),
+                )
+            raise
         if api_trace_id:
             result, _usage = result_tuple
             logger.info(

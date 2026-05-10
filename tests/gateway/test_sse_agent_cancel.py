@@ -247,6 +247,179 @@ class TestSSEAgentCancelOnDisconnect:
 
         asyncio.run(run())
 
+    def test_chat_sse_task_cancellation_interrupts_agent(self):
+        """If aiohttp cancels the SSE handler, the background agent must stop."""
+        adapter = _make_adapter()
+        stream_q = queue.Queue()
+        mock_agent = MagicMock()
+        mock_agent.interrupt = MagicMock()
+
+        async def fake_agent():
+            await asyncio.sleep(999)
+            return {"final_response": "done"}, {}
+
+        async def run():
+            from aiohttp import web
+
+            agent_task = asyncio.ensure_future(fake_agent())
+            writer_task = None
+
+            mock_response = AsyncMock(spec=web.StreamResponse)
+            mock_response.write = AsyncMock()
+            mock_response.prepare = AsyncMock()
+
+            with patch("gateway.platforms.api_server.web.StreamResponse",
+                       return_value=mock_response):
+                writer_task = asyncio.create_task(
+                    adapter._write_sse_chat_completion(
+                        _make_request(), "cmpl-cancel", "gpt-4", 1234567890,
+                        stream_q, agent_task, [mock_agent],
+                    )
+                )
+                while not mock_response.prepare.called:
+                    await asyncio.sleep(0)
+                writer_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await writer_task
+
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            assert agent_task.cancelled()
+
+        asyncio.run(run())
+
+    def test_chat_sse_prepare_cancellation_interrupts_agent(self):
+        """Cancellation during StreamResponse.prepare still cleans up the agent."""
+        adapter = _make_adapter()
+        stream_q = queue.Queue()
+        mock_agent = MagicMock()
+        mock_agent.interrupt = MagicMock()
+        prepare_started = asyncio.Event()
+        release_prepare = asyncio.Event()
+
+        async def fake_agent():
+            await asyncio.sleep(999)
+            return {"final_response": "done"}, {}
+
+        async def run():
+            from aiohttp import web
+
+            agent_task = asyncio.ensure_future(fake_agent())
+
+            async def prepare_side_effect(request):
+                prepare_started.set()
+                await release_prepare.wait()
+
+            mock_response = AsyncMock(spec=web.StreamResponse)
+            mock_response.prepare = AsyncMock(side_effect=prepare_side_effect)
+            mock_response.write = AsyncMock()
+
+            with patch("gateway.platforms.api_server.web.StreamResponse",
+                       return_value=mock_response):
+                writer_task = asyncio.create_task(
+                    adapter._write_sse_chat_completion(
+                        _make_request(), "cmpl-prepare-cancel", "gpt-4", 1234567890,
+                        stream_q, agent_task, [mock_agent],
+                    )
+                )
+                await prepare_started.wait()
+                writer_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await writer_task
+
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            assert agent_task.cancelled()
+
+        asyncio.run(run())
+
+    def test_responses_sse_task_cancellation_interrupts_agent(self):
+        """Responses streaming has the same cancellation contract as chat SSE."""
+        adapter = _make_adapter()
+        stream_q = queue.Queue()
+        mock_agent = MagicMock()
+        mock_agent.interrupt = MagicMock()
+
+        async def fake_agent():
+            await asyncio.sleep(999)
+            return {"final_response": "done"}, {}
+
+        async def run():
+            from aiohttp import web
+
+            agent_task = asyncio.ensure_future(fake_agent())
+
+            mock_response = AsyncMock(spec=web.StreamResponse)
+            mock_response.write = AsyncMock()
+            mock_response.prepare = AsyncMock()
+
+            with patch("gateway.platforms.api_server.web.StreamResponse",
+                       return_value=mock_response):
+                writer_task = asyncio.create_task(
+                    adapter._write_sse_responses(
+                        _make_request(), "resp-cancel", "gpt-4", 1234567890,
+                        stream_q, agent_task, [mock_agent],
+                        conversation_history=[], user_message="hello",
+                        instructions=None, conversation=None, store=False,
+                        session_id="cancel-session",
+                    )
+                )
+                while not mock_response.prepare.called:
+                    await asyncio.sleep(0)
+                writer_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await writer_task
+
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            assert agent_task.cancelled()
+
+        asyncio.run(run())
+
+    def test_responses_sse_prepare_cancellation_interrupts_agent(self):
+        """Responses prepare cancellation has the same cleanup contract."""
+        adapter = _make_adapter()
+        stream_q = queue.Queue()
+        mock_agent = MagicMock()
+        mock_agent.interrupt = MagicMock()
+        prepare_started = asyncio.Event()
+        release_prepare = asyncio.Event()
+
+        async def fake_agent():
+            await asyncio.sleep(999)
+            return {"final_response": "done"}, {}
+
+        async def run():
+            from aiohttp import web
+
+            agent_task = asyncio.ensure_future(fake_agent())
+
+            async def prepare_side_effect(request):
+                prepare_started.set()
+                await release_prepare.wait()
+
+            mock_response = AsyncMock(spec=web.StreamResponse)
+            mock_response.prepare = AsyncMock(side_effect=prepare_side_effect)
+            mock_response.write = AsyncMock()
+
+            with patch("gateway.platforms.api_server.web.StreamResponse",
+                       return_value=mock_response):
+                writer_task = asyncio.create_task(
+                    adapter._write_sse_responses(
+                        _make_request(), "resp-prepare-cancel", "gpt-4", 1234567890,
+                        stream_q, agent_task, [mock_agent],
+                        conversation_history=[], user_message="hello",
+                        instructions=None, conversation=None, store=False,
+                        session_id="cancel-session",
+                    )
+                )
+                await prepare_started.wait()
+                writer_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await writer_task
+
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            assert agent_task.cancelled()
+
+        asyncio.run(run())
+
     def test_agent_ref_none_still_cancels_task(self):
         """When agent_ref is not provided (None), the task is still cancelled
         on disconnect — just without the interrupt() call."""

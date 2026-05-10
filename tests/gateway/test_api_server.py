@@ -15,6 +15,7 @@ Tests cover:
 import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -330,6 +331,171 @@ class TestAdapterInit:
             adapter._create_agent(voice_mode=False)
 
         assert created["enabled_toolsets"] == ["files", "session_search", "skills"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_interrupts_agent_when_async_task_is_cancelled(adapter, monkeypatch):
+    created_agent = {}
+    entered_run = threading.Event()
+    release_run = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self, **kwargs):
+            self.interrupt_reason = None
+            created_agent["agent"] = self
+
+        def run_conversation(self, **kwargs):
+            entered_run.set()
+            while not release_run.is_set():
+                time.sleep(0.01)
+            return {"final_response": "late"}
+
+        def interrupt(self, reason):
+            self.interrupt_reason = reason
+            release_run.set()
+
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+    with (
+        patch("run_agent.AIAgent", FakeAgent),
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": []}}),
+        patch("hermes_cli.tools_config._get_platform_tools", return_value=set()),
+        patch("gateway.run.GatewayRunner._load_fallback_model", return_value={}),
+    ):
+        task = asyncio.create_task(
+            adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="cancel-test",
+                api_trace_id="cancel-trace",
+                agent_ref=[None],
+            )
+        )
+        assert await asyncio.to_thread(entered_run.wait, 1.0) is True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert created_agent["agent"].interrupt_reason == "api task cancelled"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_preserves_existing_interrupt_reason_when_cancelled(adapter, monkeypatch):
+    agent_ref = [None]
+    entered_run = threading.Event()
+    release_run = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self, **kwargs):
+            self._interrupt_requested = True
+            self.interrupt_reason = "SSE client disconnected"
+            self.interrupt_calls = []
+
+        def run_conversation(self, **kwargs):
+            entered_run.set()
+            release_run.wait(1.0)
+            return {"final_response": "late"}
+
+        def interrupt(self, reason):
+            self.interrupt_calls.append(reason)
+            self.interrupt_reason = reason
+
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+    with (
+        patch("run_agent.AIAgent", FakeAgent),
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": []}}),
+        patch("hermes_cli.tools_config._get_platform_tools", return_value=set()),
+        patch("gateway.run.GatewayRunner._load_fallback_model", return_value={}),
+    ):
+        task = asyncio.create_task(
+            adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="cancel-test",
+                api_trace_id="cancel-trace",
+                agent_ref=agent_ref,
+            )
+        )
+        assert await asyncio.to_thread(entered_run.wait, 1.0) is True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release_run.set()
+
+    agent = agent_ref[0]
+    assert agent.interrupt_calls == []
+    assert agent.interrupt_reason == "SSE client disconnected"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_intercepts_cancellation_before_agent_ref_is_published(adapter, monkeypatch):
+    create_started = threading.Event()
+    release_create = threading.Event()
+    created = {}
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self):
+            self.interrupt_reason = None
+            self.run_called = False
+            created["agent"] = self
+
+        def interrupt(self, reason):
+            self.interrupt_reason = reason
+
+        def run_conversation(self, **kwargs):
+            self.run_called = True
+            return {"final_response": "should not run"}
+
+    def fake_create_agent(**kwargs):
+        create_started.set()
+        release_create.wait(1.0)
+        return FakeAgent()
+
+    monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
+
+    agent_ref = [None]
+    task = asyncio.create_task(
+        adapter._run_agent(
+            user_message="hello",
+            conversation_history=[],
+            session_id="pre-ref-cancel-test",
+            api_trace_id="pre-ref-cancel-trace",
+            agent_ref=agent_ref,
+        )
+    )
+    assert await asyncio.to_thread(create_started.wait, 1.0) is True
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release_create.set()
+
+    for _ in range(100):
+        agent = created.get("agent")
+        if agent is not None and agent.interrupt_reason:
+            break
+        await asyncio.sleep(0.01)
+
+    agent = created["agent"]
+    assert agent_ref[0] is agent
+    assert agent.interrupt_reason == "api task cancelled"
+    assert agent.run_called is False
 
 
 # ---------------------------------------------------------------------------
