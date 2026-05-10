@@ -307,6 +307,72 @@ class TestAdapterInit:
         assert created["enabled_toolsets"] == ["files", "memory"]
         assert created["max_iterations"] == 90
 
+    def test_voice_mode_removes_session_search_by_default(self, adapter, monkeypatch):
+        created = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                created.update(kwargs)
+
+        monkeypatch.delenv("HERMES_API_VOICE_DISABLED_TOOLSETS", raising=False)
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        with (
+            patch("run_agent.AIAgent", FakeAgent),
+            patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": ["files", "session_search", "skills"]}}),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value={"files", "session_search", "skills"}),
+            patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None),
+        ):
+            adapter._create_agent(voice_mode=True)
+
+        assert created["enabled_toolsets"] == ["files", "skills"]
+
+    def test_voice_mode_disabled_toolsets_can_be_configured(self, adapter, monkeypatch):
+        created = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                created.update(kwargs)
+
+        monkeypatch.setenv("HERMES_API_VOICE_DISABLED_TOOLSETS", "session_search,skills")
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        with (
+            patch("run_agent.AIAgent", FakeAgent),
+            patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": ["files", "session_search", "skills"]}}),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value={"files", "session_search", "skills"}),
+            patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None),
+        ):
+            adapter._create_agent(voice_mode=True)
+
+        assert created["enabled_toolsets"] == ["files"]
+
+    def test_text_mode_keeps_session_search_toolset(self, adapter, monkeypatch):
+        created = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                created.update(kwargs)
+
+        monkeypatch.delenv("HERMES_API_VOICE_DISABLED_TOOLSETS", raising=False)
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        with (
+            patch("run_agent.AIAgent", FakeAgent),
+            patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": ["files", "session_search", "skills"]}}),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value={"files", "session_search", "skills"}),
+            patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None),
+        ):
+            adapter._create_agent(voice_mode=False)
+
+        assert created["enabled_toolsets"] == ["files", "session_search", "skills"]
+
 
 # ---------------------------------------------------------------------------
 # Auth checking
