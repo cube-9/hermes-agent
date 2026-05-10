@@ -74,6 +74,14 @@ def _get_session_search_timeout(default: float = 30.0) -> float:
     return value
 
 
+def _session_search_interrupted() -> bool:
+    try:
+        from tools.interrupt import is_interrupted
+        return is_interrupted()
+    except Exception:
+        return False
+
+
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     """Convert a Unix timestamp (float/int) or ISO string to a human-readable date.
 
@@ -486,6 +494,15 @@ def session_search(
                     exc_info=True,
                 )
 
+        if _session_search_interrupted():
+            return json.dumps({
+                "success": False,
+                "query": query,
+                "error": "Session search interrupted before summarization.",
+                "interrupted": True,
+                "sessions_prepared": len(tasks),
+            }, ensure_ascii=False)
+
         # Summarize all sessions in parallel
         timeout_seconds = _get_session_search_timeout()
 
@@ -495,7 +512,11 @@ def session_search(
             semaphore = asyncio.Semaphore(max_concurrency)
 
             async def _bounded_summary(text: str, meta: Dict[str, Any]) -> Optional[str]:
+                if _session_search_interrupted():
+                    raise InterruptedError("Session search interrupted before summary request")
                 async with semaphore:
+                    if _session_search_interrupted():
+                        raise InterruptedError("Session search interrupted before summary request")
                     return await _summarize_session(
                         text, query, meta, timeout=timeout_seconds
                     )
@@ -518,6 +539,14 @@ def session_search(
             # causing deadlocks in gateway mode (#2681).
             from model_tools import _run_async
             results = _run_async(_summarize_all())
+            if any(isinstance(result, InterruptedError) for result in results):
+                return json.dumps({
+                    "success": False,
+                    "query": query,
+                    "error": "Session search interrupted before summarization completed.",
+                    "interrupted": True,
+                    "sessions_prepared": len(tasks),
+                }, ensure_ascii=False)
         except (TimeoutError, concurrent.futures.TimeoutError):
             logging.warning(
                 "Session summarization timed out after %.2f seconds",
