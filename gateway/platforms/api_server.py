@@ -143,6 +143,15 @@ def _messages_summary(messages: List[Any]) -> Dict[str, Any]:
     }
 
 
+def _voice_disabled_toolsets() -> set[str]:
+    raw_value = os.getenv("HERMES_API_VOICE_DISABLED_TOOLSETS", "session_search")
+    return {
+        item.strip()
+        for item in raw_value.split(",")
+        if item.strip()
+    }
+
+
 def _normalize_chat_content(
     content: Any, *, _max_depth: int = 10, _depth: int = 0,
 ) -> str:
@@ -816,7 +825,10 @@ class APIServerAdapter(BasePlatformAdapter):
         model = _resolve_gateway_model()
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets_set = set(_get_platform_tools(user_config, "api_server"))
+        if voice_mode:
+            enabled_toolsets_set -= _voice_disabled_toolsets()
+        enabled_toolsets = sorted(enabled_toolsets_set)
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
         # Load fallback provider chain so the API server platform has the
