@@ -33,6 +33,7 @@ import os
 import socket as _socket
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -50,6 +51,11 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from gateway.voice_context import (
+    _is_voice_mode_chat_request,
+    _limit_voice_history,
+    _voice_memory_prefetch_char_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,109 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+TRACE_HEADER = "X-Hermes-Trace-Id"
+STATELESS_HEADER = "X-Hermes-Stateless"
+VOICE_SESSION_HEADER = "X-Hermes-Voice-Session-Id"
+VOICE_TURN_HEADER = "X-Hermes-Voice-Turn-Id"
+VOICE_FIRST_TEXT_DELTA_TIMEOUT_ENV = "HERMES_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS"
+DEFAULT_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS = 90.0
+VOICE_FIRST_TEXT_TIMEOUT_MESSAGE = (
+    "Hermes is still working but did not produce assistant text in time. "
+    "Please try again."
+)
+
+
+def _new_api_trace_id() -> str:
+    """Generate a compact request trace id for API caller postmortems."""
+    return f"api-{uuid.uuid4().hex[:16]}"
+
+
+def _request_trace_id(request: "web.Request") -> str:
+    """Return a caller-provided trace id, sanitized for logs/headers."""
+    raw_trace_id = request.headers.get(TRACE_HEADER, "").strip()
+    if not raw_trace_id:
+        return _new_api_trace_id()
+    return re.sub(r"[^A-Za-z0-9_.:-]", "-", raw_trace_id)[:128] or _new_api_trace_id()
+
+
+def _truthy_header(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _voice_first_text_delta_timeout_seconds() -> float:
+    raw_value = os.getenv(
+        VOICE_FIRST_TEXT_DELTA_TIMEOUT_ENV,
+        str(DEFAULT_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS),
+    )
+    try:
+        timeout = float(raw_value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "invalid %s=%r; using default %.1fs",
+            VOICE_FIRST_TEXT_DELTA_TIMEOUT_ENV,
+            raw_value,
+            DEFAULT_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS
+    return max(0.0, timeout)
+
+
+def _log_safe(value: Any, *, max_length: int = 128) -> str:
+    """Make user-controlled scalar values safe for single-line structured logs."""
+    text = str(value)
+    safe = "".join(ch if ch.isprintable() and ch not in "\r\n\t" else "-" for ch in text)
+    return safe[:max_length]
+
+
+def _interrupt_agent_ref(agent_ref: Optional[List[Any]], reason: str) -> None:
+    agent = agent_ref[0] if agent_ref else None
+    if agent is None:
+        return
+    try:
+        if getattr(agent, "_interrupt_requested", False) is True:
+            return
+        agent.interrupt(reason)
+    except Exception:
+        pass
+
+
+async def _cancel_stream_agent_task(agent_task, agent_ref: Optional[List[Any]], reason: str) -> None:
+    _interrupt_agent_ref(agent_ref, reason)
+    if not agent_task.done():
+        agent_task.cancel()
+        try:
+            await agent_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+def _messages_summary(messages: List[Any]) -> Dict[str, Any]:
+    """Summarize chat messages for one-line request logging."""
+    roles: List[str] = []
+    user_chars = 0
+    assistant_chars = 0
+    system_chars = 0
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        raw_role = str(msg.get("role", ""))
+        roles.append(_log_safe(raw_role, max_length=64))
+        content_length = len(_normalize_chat_content(msg.get("content", "")))
+        if raw_role == "user":
+            user_chars += content_length
+        elif raw_role == "assistant":
+            assistant_chars += content_length
+        elif raw_role == "system":
+            system_chars += content_length
+
+    return {
+        "count": len(messages),
+        "roles": ",".join(roles[-8:]),
+        "user_chars": user_chars,
+        "assistant_chars": assistant_chars,
+        "system_chars": system_chars,
+    }
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -69,6 +178,15 @@ def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _voice_disabled_toolsets() -> set[str]:
+    raw_value = os.getenv("HERMES_API_VOICE_DISABLED_TOOLSETS", "session_search")
+    return {
+        item.strip()
+        for item in raw_value.split(",")
+        if item.strip()
+    }
 
 
 def _normalize_chat_content(
@@ -404,7 +522,11 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": (
+        f"Authorization, Content-Type, Idempotency-Key, {TRACE_HEADER}, "
+        f"X-Hermes-Session-Id, {STATELESS_HEADER}"
+    ),
+    "Access-Control-Expose-Headers": f"{TRACE_HEADER}, X-Hermes-Session-Id",
 }
 
 
@@ -485,6 +607,7 @@ class _IdempotencyCache:
         from collections import OrderedDict
         self._store = OrderedDict()
         self._inflight: Dict[tuple[str, str], "asyncio.Task[Any]"] = {}
+        self._waiters: Dict[tuple[str, str], int] = {}
         self._ttl = ttl_seconds
         self._max = max_items
 
@@ -496,7 +619,14 @@ class _IdempotencyCache:
         while len(self._store) > self._max:
             self._store.popitem(last=False)
 
-    async def get_or_set(self, key: str, fingerprint: str, compute_coro):
+    async def get_or_set(
+        self,
+        key: str,
+        fingerprint: str,
+        compute_coro,
+        *,
+        cancel_inflight_on_waiter_cancel: bool = False,
+    ):
         self._purge()
         item = self._store.get(key)
         if item and item["fp"] == fingerprint:
@@ -518,10 +648,28 @@ class _IdempotencyCache:
             def _clear_inflight(done_task: "asyncio.Task[Any]") -> None:
                 if self._inflight.get(inflight_key) is done_task:
                     self._inflight.pop(inflight_key, None)
+                    self._waiters.pop(inflight_key, None)
 
             task.add_done_callback(_clear_inflight)
 
-        return await asyncio.shield(task)
+        self._waiters[inflight_key] = self._waiters.get(inflight_key, 0) + 1
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if cancel_inflight_on_waiter_cancel:
+                remaining_waiters = self._waiters.get(inflight_key, 1) - 1
+                if remaining_waiters <= 0 and not task.done():
+                    task.cancel()
+            raise
+        finally:
+            current_waiters = self._waiters.get(inflight_key, 0)
+            if current_waiters <= 1:
+                if task.done():
+                    self._waiters.pop(inflight_key, None)
+                else:
+                    self._waiters[inflight_key] = 0
+            else:
+                self._waiters[inflight_key] = current_waiters - 1
 
 
 _idem_cache = _IdempotencyCache()
@@ -799,6 +947,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        memory_prefetch_char_limit: Optional[int] = None,
+        voice_mode: bool = False,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -829,8 +979,10 @@ class APIServerAdapter(BasePlatformAdapter):
         model = _resolve_gateway_model()
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
-
+        enabled_toolsets_set = set(_get_platform_tools(user_config, "api_server"))
+        if voice_mode:
+            enabled_toolsets_set -= _voice_disabled_toolsets()
+        enabled_toolsets = sorted(enabled_toolsets_set)
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
         # Load fallback provider chain so the API server platform has the
@@ -847,6 +999,7 @@ class APIServerAdapter(BasePlatformAdapter):
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
+            memory_prefetch_char_limit=memory_prefetch_char_limit,
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
@@ -979,6 +1132,9 @@ class APIServerAdapter(BasePlatformAdapter):
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
+        trace_id = _request_trace_id(request)
+        voice_session_id = request.headers.get(VOICE_SESSION_HEADER, "").strip()
+        voice_turn_id = request.headers.get(VOICE_TURN_HEADER, "").strip()
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
             return web.json_response(
@@ -1023,6 +1179,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        stateless_requested = _truthy_header(request.headers.get(STATELESS_HEADER, ""))
+
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This
         # is independent of X-Hermes-Session-Id: the key persists across
@@ -1040,7 +1198,20 @@ class APIServerAdapter(BasePlatformAdapter):
         # authenticated.  Without this gate, any unauthenticated client could
         # read arbitrary session history by guessing/enumerating session IDs.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
-        if provided_session_id:
+        if stateless_requested and provided_session_id:
+            return web.json_response(
+                _openai_error(
+                    f"{STATELESS_HEADER} cannot be combined with X-Hermes-Session-Id.",
+                    code="invalid_request",
+                ),
+                status=400,
+            )
+        if stateless_requested:
+            # Diagnostic replay mode: keep the exact OpenAI request-body history,
+            # but isolate persistence under a fresh Hermes session so repeated
+            # provider repro samples do not accumulate state.
+            session_id = f"api-stateless-{uuid.uuid4().hex[:16]}"
+        elif provided_session_id:
             if not self._api_key:
                 logger.warning(
                     "Session continuation via X-Hermes-Session-Id rejected: "
@@ -1066,7 +1237,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 if db is not None:
                     history = db.get_messages_as_conversation(session_id)
             except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
+                logger.warning("Failed to load session history for %s: %s", _log_safe(session_id), e)
                 history = []
         else:
             # Derive a stable session ID from the conversation fingerprint so
@@ -1081,9 +1252,39 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
+        is_voice_mode = _is_voice_mode_chat_request(messages)
+        history = _limit_voice_history(history, messages)
+        memory_prefetch_char_limit = (
+            _voice_memory_prefetch_char_limit()
+            if is_voice_mode
+            else None
+        )
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
+        messages_summary = _messages_summary(messages)
+
+        logger.info(
+            "api request started trace_id=%s endpoint=/v1/chat/completions "
+            "completion_id=%s session_id=%s model=%s stream=%s voice_mode=%s "
+            "stateless=%s voice_session_id=%s voice_turn_id=%s "
+            "message_count=%s roles=%s user_chars=%s assistant_chars=%s system_chars=%s",
+            trace_id,
+            completion_id,
+            _log_safe(session_id),
+            _log_safe(model_name),
+            stream,
+            is_voice_mode,
+            stateless_requested,
+            _log_safe(voice_session_id),
+            _log_safe(voice_turn_id),
+            messages_summary["count"],
+            messages_summary["roles"],
+            messages_summary["user_chars"],
+            messages_summary["assistant_chars"],
+            messages_summary["system_chars"],
+        )
 
         if stream:
             import queue as _q
@@ -1162,20 +1363,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                memory_prefetch_char_limit=memory_prefetch_char_limit,
+                voice_mode=is_voice_mode,
                 stream_delta_callback=_on_delta,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                api_trace_id=trace_id,
+                api_voice_session_id=voice_session_id,
+                api_voice_turn_id=voice_turn_id,
             ))
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                trace_id=trace_id,
+                voice_session_id=voice_session_id, voice_turn_id=voice_turn_id,
             )
 
-        # Non-streaming: run the agent (with optional Idempotency-Key)
+        # Non-streaming: run the agent (with optional Idempotency-Key).
+        # Keep an agent_ref so request cancellation can interrupt the executor
+        # thread's live AIAgent, matching the streaming cleanup path.
+        non_stream_agent_ref = [None]
+
         async def _compute_completion():
             return await self._run_agent(
                 user_message=user_message,
@@ -1183,13 +1395,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                memory_prefetch_char_limit=memory_prefetch_char_limit,
+                voice_mode=is_voice_mode,
+                api_trace_id=trace_id,
+                api_voice_session_id=voice_session_id,
+                api_voice_turn_id=voice_turn_id,
+                agent_ref=non_stream_agent_ref,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
             fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+                result, usage = await _idem_cache.get_or_set(
+                    idempotency_key,
+                    fp,
+                    _compute_completion,
+                    cancel_inflight_on_waiter_cancel=True,
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -1224,6 +1447,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         response_headers = {
             "X-Hermes-Session-Id": result.get("session_id", session_id),
+            TRACE_HEADER: trace_id,
         }
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -1289,6 +1513,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None,
+        trace_id: str = None,
+        voice_session_id: str = "",
+        voice_turn_id: str = "",
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -1313,11 +1540,20 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Id"] = session_id
         if gateway_session_key:
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
+        if trace_id:
+            sse_headers[TRACE_HEADER] = trace_id
         response = web.StreamResponse(status=200, headers=sse_headers)
-        await response.prepare(request)
 
         try:
+            await response.prepare(request)
             last_activity = time.monotonic()
+            stream_started = last_activity
+            first_text_delta_at = None
+            text_chunks = 0
+            text_chars = 0
+            tool_progress_events = 0
+            keepalive_count = 0
+            safe_session_id = _log_safe(session_id)
 
             # Role chunk
             role_chunk = {
@@ -1339,26 +1575,120 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
+                nonlocal first_text_delta_at
+                nonlocal text_chunks
+                nonlocal text_chars
+                nonlocal tool_progress_events
+
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
+                    tool_progress_events += 1
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
                 else:
+                    text = str(item)
+                    if first_text_delta_at is None:
+                        first_text_delta_at = time.monotonic()
+                        logger.info(
+                            "api stream first_text_delta trace_id=%s completion_id=%s "
+                            "session_id=%s elapsed_ms=%s",
+                            trace_id,
+                            completion_id,
+                            safe_session_id,
+                            int((first_text_delta_at - stream_started) * 1000),
+                        )
+                    text_chunks += 1
+                    text_chars += len(text)
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
                     }
                     await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 return time.monotonic()
 
+            async def _emit_error_event(message: str, error_type: str) -> None:
+                error = {
+                    "message": message,
+                    "type": error_type,
+                }
+                if error_type == "first_text_timeout":
+                    error["reason"] = "first assistant text timeout"
+                error_event = {
+                    "error": error,
+                    "trace_id": trace_id,
+                    "completion_id": completion_id,
+                    "session_id": safe_session_id,
+                    "voice_session_id": _log_safe(voice_session_id),
+                    "voice_turn_id": _log_safe(voice_turn_id),
+                }
+                await response.write(f"event: error\ndata: {json.dumps(error_event)}\n\n".encode())
+
+            voice_first_text_timeout_seconds = _voice_first_text_delta_timeout_seconds()
+            enforce_voice_first_text_timeout = bool(voice_session_id or voice_turn_id)
+            first_text_deadline = (
+                stream_started + voice_first_text_timeout_seconds
+                if enforce_voice_first_text_timeout and voice_first_text_timeout_seconds > 0
+                else None
+            )
+            voice_first_text_timed_out = False
+
             # Stream content chunks as they arrive from the agent
             loop = asyncio.get_running_loop()
             while True:
+                queue_wait_timeout = 0.5
+                if first_text_delta_at is None and first_text_deadline is not None:
+                    queue_wait_timeout = max(0.0, min(queue_wait_timeout, first_text_deadline - time.monotonic()))
                 try:
-                    delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
+                    delta = await loop.run_in_executor(
+                        None,
+                        lambda: stream_q.get(timeout=queue_wait_timeout),
+                    )
                 except _q.Empty:
+                    if (
+                        first_text_delta_at is None
+                        and first_text_deadline is not None
+                        and time.monotonic() >= first_text_deadline
+                        and not agent_task.done()
+                    ):
+                        elapsed_ms = int((time.monotonic() - stream_started) * 1000)
+                        logger.warning(
+                            "api stream first_text_timeout trace_id=%s completion_id=%s session_id=%s "
+                            "voice_session_id=%s voice_turn_id=%s elapsed_ms=%s timeout_secs=%s "
+                            "text_chunks=%s text_chars=%s keepalives=%s tool_progress_events=%s",
+                            trace_id,
+                            completion_id,
+                            safe_session_id,
+                            _log_safe(voice_session_id),
+                            _log_safe(voice_turn_id),
+                            elapsed_ms,
+                            voice_first_text_timeout_seconds,
+                            text_chunks,
+                            text_chars,
+                            keepalive_count,
+                            tool_progress_events,
+                        )
+                        agent = agent_ref[0] if agent_ref else None
+                        if agent is not None:
+                            try:
+                                agent.interrupt("voice first assistant text timeout")
+                            except Exception:
+                                pass
+                        if not agent_task.done():
+                            agent_task.cancel()
+                            try:
+                                await agent_task
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception:
+                                pass
+                        await _emit_error_event(
+                            VOICE_FIRST_TEXT_TIMEOUT_MESSAGE,
+                            "first_text_timeout",
+                        )
+                        voice_first_text_timed_out = True
+                        break
                     if agent_task.done():
                         # Drain any remaining items
                         while True:
@@ -1372,6 +1702,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         break
                     if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
                         await response.write(b": keepalive\n\n")
+                        keepalive_count += 1
                         last_activity = time.monotonic()
                     continue
 
@@ -1380,13 +1711,74 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 last_activity = await _emit(delta)
 
+            if voice_first_text_timed_out:
+                await response.write(b"data: [DONE]\n\n")
+                return response
+
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            final_response_text = ""
+            final_response_chars = 0
+            agent_error = None
             try:
                 result, agent_usage = await agent_task
+                final_response_text = str((result or {}).get("final_response") or "")
+                final_response_chars = len(final_response_text)
                 usage = agent_usage or usage
-            except Exception as exc:
-                logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
+            except Exception as e:
+                agent_error = e
+                elapsed_ms = int((time.monotonic() - stream_started) * 1000)
+                logger.exception(
+                    "api stream failed trace_id=%s completion_id=%s session_id=%s "
+                    "elapsed_ms=%s text_chunks=%s text_chars=%s final_response_chars=%s "
+                    "keepalives=%s tool_progress_events=%s error=%s",
+                    trace_id,
+                    completion_id,
+                    safe_session_id,
+                    elapsed_ms,
+                    text_chunks,
+                    text_chars,
+                    final_response_chars,
+                    keepalive_count,
+                    tool_progress_events,
+                    e,
+                )
+                await _emit_error_event(str(e), "server_error")
+
+            if agent_error is not None:
+                return response
+
+            elapsed_ms = int((time.monotonic() - stream_started) * 1000)
+            if text_chars == 0:
+                logger.warning(
+                    "api stream zero body trace_id=%s completion_id=%s session_id=%s "
+                    "elapsed_ms=%s text_chunks=%s text_chars=%s final_response_chars=%s "
+                    "keepalives=%s tool_progress_events=%s",
+                    trace_id,
+                    completion_id,
+                    safe_session_id,
+                    elapsed_ms,
+                    text_chunks,
+                    text_chars,
+                    final_response_chars,
+                    keepalive_count,
+                    tool_progress_events,
+                )
+            else:
+                logger.info(
+                    "api stream completed trace_id=%s completion_id=%s session_id=%s "
+                    "elapsed_ms=%s text_chunks=%s text_chars=%s final_response_chars=%s "
+                    "keepalives=%s tool_progress_events=%s",
+                    trace_id,
+                    completion_id,
+                    safe_session_id,
+                    elapsed_ms,
+                    text_chunks,
+                    text_chars,
+                    final_response_chars,
+                    keepalive_count,
+                    tool_progress_events,
+                )
 
             # Finish chunk
             finish_chunk = {
@@ -1401,23 +1793,32 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
+        except asyncio.CancelledError:
+            await _cancel_stream_agent_task(agent_task, agent_ref, "SSE client disconnected")
+            logger.info(
+                "SSE stream cancelled; interrupted agent task %s trace_id=%s session_id=%s "
+                "voice_session_id=%s voice_turn_id=%s",
+                completion_id,
+                trace_id,
+                _log_safe(session_id),
+                _log_safe(voice_session_id),
+                _log_safe(voice_turn_id),
+            )
+            raise
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected mid-stream.  Interrupt the agent so it
             # stops making LLM API calls at the next loop iteration, then
             # cancel the asyncio task wrapper.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    agent.interrupt("SSE client disconnected")
-                except Exception:
-                    pass
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
+            await _cancel_stream_agent_task(agent_task, agent_ref, "SSE client disconnected")
+            logger.info(
+                "SSE client disconnected; interrupted agent task %s trace_id=%s session_id=%s "
+                "voice_session_id=%s voice_turn_id=%s",
+                completion_id,
+                trace_id,
+                _log_safe(session_id),
+                _log_safe(voice_session_id),
+                _log_safe(voice_turn_id),
+            )
         except Exception as _exc:
             # Agent crashed mid-stream.  Try to emit an error chunk
             # so the client gets a proper response instead of a
@@ -1498,7 +1899,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if gateway_session_key:
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
-        await response.prepare(request)
 
         # State accumulated during the stream
         final_text_parts: List[str] = []
@@ -1600,6 +2000,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         try:
+            await response.prepare(request)
             # response.created — initial envelope, status=in_progress
             created_env = _envelope("in_progress")
             created_env["output"] = []
@@ -1977,18 +2378,7 @@ class APIServerAdapter(BasePlatformAdapter):
             _persist_incomplete_if_needed()
             # Client disconnected — interrupt the agent so it stops
             # making upstream LLM calls, then cancel the task.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    agent.interrupt("SSE client disconnected")
-                except Exception:
-                    pass
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await _cancel_stream_agent_task(agent_task, agent_ref, "SSE client disconnected")
             logger.info("SSE client disconnected; interrupted agent task %s", response_id)
         except asyncio.CancelledError:
             # Server-side cancellation (e.g. shutdown, request timeout) —
@@ -1996,14 +2386,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # previous_response_id chaining still work, then re-raise so the
             # runtime's cancellation semantics are respected.
             _persist_incomplete_if_needed()
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    agent.interrupt("SSE task cancelled")
-                except Exception:
-                    pass
-            if not agent_task.done():
-                agent_task.cancel()
+            await _cancel_stream_agent_task(agent_task, agent_ref, "SSE client disconnected")
             logger.info("SSE task cancelled; persisted incomplete snapshot for %s", response_id)
             raise
         except Exception as _exc:
@@ -2678,12 +3061,17 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        memory_prefetch_char_limit: Optional[int] = None,
+        voice_mode: bool = False,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        api_trace_id: str | None = None,
+        api_voice_session_id: str | None = None,
+        api_voice_turn_id: str | None = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2697,25 +3085,114 @@ class APIServerAdapter(BasePlatformAdapter):
         another thread to stop in-progress LLM calls.
         """
         loop = asyncio.get_running_loop()
+        cancel_requested = threading.Event()
+        if api_trace_id:
+            logger.info(
+                "api agent task started trace_id=%s session_id=%s voice_session_id=%s voice_turn_id=%s",
+                api_trace_id,
+                _log_safe(session_id),
+                _log_safe(api_voice_session_id or ""),
+                _log_safe(api_voice_turn_id or ""),
+            )
 
         def _run():
-            agent = self._create_agent(
-                ephemeral_system_prompt=ephemeral_system_prompt,
-                session_id=session_id,
-                stream_delta_callback=stream_delta_callback,
-                tool_progress_callback=tool_progress_callback,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
-                gateway_session_key=gateway_session_key,
-            )
+            create_started = time.monotonic()
+            if api_trace_id:
+                logger.info(
+                    "api agent create started trace_id=%s session_id=%s voice_session_id=%s "
+                    "voice_turn_id=%s voice_mode=%s history_messages=%s user_chars=%s",
+                    api_trace_id,
+                    _log_safe(session_id),
+                    _log_safe(api_voice_session_id or ""),
+                    _log_safe(api_voice_turn_id or ""),
+                    voice_mode,
+                    len(conversation_history),
+                    len(str(user_message)),
+                )
+            try:
+                agent = self._create_agent(
+                    ephemeral_system_prompt=ephemeral_system_prompt,
+                    session_id=session_id,
+                    memory_prefetch_char_limit=memory_prefetch_char_limit,
+                    voice_mode=voice_mode,
+                    stream_delta_callback=stream_delta_callback,
+                    tool_progress_callback=tool_progress_callback,
+                    tool_start_callback=tool_start_callback,
+                    tool_complete_callback=tool_complete_callback,
+                    gateway_session_key=gateway_session_key,
+                )
+            except Exception:
+                if api_trace_id:
+                    logger.exception(
+                        "api agent create failed trace_id=%s session_id=%s voice_session_id=%s "
+                        "voice_turn_id=%s elapsed_ms=%s",
+                        api_trace_id,
+                        _log_safe(session_id),
+                        _log_safe(api_voice_session_id or ""),
+                        _log_safe(api_voice_turn_id or ""),
+                        int((time.monotonic() - create_started) * 1000),
+                    )
+                raise
+
+            if api_trace_id:
+                logger.info(
+                    "api agent create completed trace_id=%s session_id=%s voice_session_id=%s "
+                    "voice_turn_id=%s elapsed_ms=%s agent_class=%s",
+                    api_trace_id,
+                    _log_safe(session_id),
+                    _log_safe(api_voice_session_id or ""),
+                    _log_safe(api_voice_turn_id or ""),
+                    int((time.monotonic() - create_started) * 1000),
+                    agent.__class__.__name__,
+                )
+
             if agent_ref is not None:
                 agent_ref[0] = agent
+            if cancel_requested.is_set():
+                try:
+                    already_interrupted = getattr(agent, "_interrupt_requested", False) is True
+                    if not already_interrupted:
+                        agent.interrupt("api task cancelled")
+                except Exception:
+                    pass
+                return {"final_response": "", "error": "api task cancelled"}, {
+                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                }
+
+            run_started = time.monotonic()
+            if api_trace_id:
+                logger.info(
+                    "api agent run_conversation started trace_id=%s session_id=%s "
+                    "voice_session_id=%s voice_turn_id=%s history_messages=%s user_chars=%s",
+                    api_trace_id,
+                    _log_safe(session_id),
+                    _log_safe(api_voice_session_id or ""),
+                    _log_safe(api_voice_turn_id or ""),
+                    len(conversation_history),
+                    len(str(user_message)),
+                )
             effective_task_id = session_id or str(uuid.uuid4())
-            result = agent.run_conversation(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                task_id=effective_task_id,
-            )
+            try:
+                result = agent.run_conversation(
+                    user_message=user_message,
+                    conversation_history=conversation_history,
+                    task_id=effective_task_id,
+                )
+            except Exception:
+                if api_trace_id:
+                    logger.exception(
+                        "api agent run_conversation failed trace_id=%s session_id=%s "
+                        "voice_session_id=%s voice_turn_id=%s elapsed_ms=%s",
+                        api_trace_id,
+                        _log_safe(session_id),
+                        _log_safe(api_voice_session_id or ""),
+                        _log_safe(api_voice_turn_id or ""),
+                        int((time.monotonic() - run_started) * 1000),
+                    )
+                raise
+
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                 "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -2727,9 +3204,57 @@ class APIServerAdapter(BasePlatformAdapter):
             _eff_sid = getattr(agent, "session_id", session_id)
             if isinstance(_eff_sid, str) and _eff_sid:
                 result["session_id"] = _eff_sid
+            if api_trace_id:
+                logger.info(
+                    "api agent run_conversation completed trace_id=%s session_id=%s "
+                    "voice_session_id=%s voice_turn_id=%s elapsed_ms=%s final_response_chars=%s "
+                    "input_tokens=%s output_tokens=%s total_tokens=%s",
+                    api_trace_id,
+                    _log_safe(session_id),
+                    _log_safe(api_voice_session_id or ""),
+                    _log_safe(api_voice_turn_id or ""),
+                    int((time.monotonic() - run_started) * 1000),
+                    len(str(result.get("final_response", ""))) if isinstance(result, dict) else 0,
+                    usage["input_tokens"],
+                    usage["output_tokens"],
+                    usage["total_tokens"],
+                )
             return result, usage
 
-        return await loop.run_in_executor(None, _run)
+        executor_future = loop.run_in_executor(None, _run)
+        try:
+            result_tuple = await executor_future
+        except asyncio.CancelledError:
+            cancel_requested.set()
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                try:
+                    already_interrupted = getattr(agent, "_interrupt_requested", False) is True
+                    if not already_interrupted:
+                        agent.interrupt("api task cancelled")
+                except Exception:
+                    pass
+            if api_trace_id:
+                logger.info(
+                    "api agent task cancelled trace_id=%s session_id=%s voice_session_id=%s voice_turn_id=%s",
+                    api_trace_id,
+                    _log_safe(session_id),
+                    _log_safe(api_voice_session_id or ""),
+                    _log_safe(api_voice_turn_id or ""),
+                )
+            raise
+        if api_trace_id:
+            result, _usage = result_tuple
+            logger.info(
+                "api agent task completed trace_id=%s session_id=%s voice_session_id=%s "
+                "voice_turn_id=%s final_response_chars=%s",
+                api_trace_id,
+                _log_safe(session_id),
+                _log_safe(api_voice_session_id or ""),
+                _log_safe(api_voice_turn_id or ""),
+                len(str(result.get("final_response", ""))) if isinstance(result, dict) else 0,
+            )
+        return result_tuple
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming

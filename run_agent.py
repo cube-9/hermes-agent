@@ -138,7 +138,12 @@ from tools.browser_tool import cleanup_browser
 
 
 # Agent internals extracted to agent/ package for modularity
-from agent.memory_manager import StreamingContextScrubber, build_memory_context_block, sanitize_context
+from agent.memory_manager import (
+    StreamingContextScrubber,
+    build_memory_context_block,
+    limit_memory_prefetch_context,
+    sanitize_context,
+)
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
@@ -1104,6 +1109,7 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        memory_prefetch_char_limit: int | None = None,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -1191,6 +1197,7 @@ class AIAgent:
         self.background_review_callback = None  # Optional sync callback for gateway delivery
         self.skip_context_files = skip_context_files
         self.load_soul_identity = load_soul_identity
+        self.memory_prefetch_char_limit = memory_prefetch_char_limit
         self.pass_session_id = pass_session_id
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
@@ -6619,16 +6626,16 @@ class AIAgent:
 
         active_client = client or self._ensure_primary_openai_client(reason="codex_stream_direct")
         max_stream_retries = 1
-        has_tool_calls = False
         first_delta_fired = False
-        # Accumulate streamed text so we can recover if get_final_response()
-        # returns empty output (e.g. chatgpt.com backend-api sends
-        # response.incomplete instead of response.completed).
-        self._codex_streamed_text_parts: list = []
         for attempt in range(max_stream_retries + 1):
             if self._interrupt_requested:
                 raise InterruptedError("Agent interrupted before Codex stream retry")
+            # Accumulate streamed text per attempt so recovery never returns
+            # partial text from a stream that was already discarded for retry.
+            self._codex_streamed_text_parts: list = []
             collected_output_items: list = []
+            has_tool_calls = False
+            terminal_event_type = None
             try:
                 with active_client.responses.stream(**api_kwargs) as stream:
                     for event in stream:
@@ -6668,6 +6675,7 @@ class AIAgent:
                                 collected_output_items.append(done_item)
                         # Log non-completed terminal events for diagnostics
                         elif event_type in ("response.incomplete", "response.failed"):
+                            terminal_event_type = event_type
                             resp_obj = getattr(event, "response", None)
                             status = getattr(resp_obj, "status", None) if resp_obj else None
                             incomplete_details = getattr(resp_obj, "incomplete_details", None) if resp_obj else None
@@ -6684,24 +6692,16 @@ class AIAgent:
                     # Backfill from collected items or synthesize from deltas.
                     _out = getattr(final_response, "output", None)
                     if isinstance(_out, list) and not _out:
-                        if collected_output_items:
-                            final_response.output = list(collected_output_items)
-                            logger.debug(
-                                "Codex stream: backfilled %d output items from stream events",
-                                len(collected_output_items),
-                            )
-                        elif self._codex_streamed_text_parts and not has_tool_calls:
-                            assembled = "".join(self._codex_streamed_text_parts)
-                            final_response.output = [SimpleNamespace(
-                                type="message",
-                                role="assistant",
-                                status="completed",
-                                content=[SimpleNamespace(type="output_text", text=assembled)],
-                            )]
-                            logger.debug(
-                                "Codex stream: synthesized output from %d text deltas (%d chars)",
-                                len(self._codex_streamed_text_parts), len(assembled),
-                            )
+                        recovered_response = self._recover_codex_stream_response(
+                            final_response=final_response,
+                            collected_output_items=collected_output_items,
+                            text_parts=self._codex_streamed_text_parts,
+                            has_tool_calls=has_tool_calls,
+                            model=api_kwargs.get("model"),
+                            reason="empty final output",
+                        )
+                        if recovered_response is not None:
+                            return recovered_response
                     return final_response
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
@@ -6737,6 +6737,60 @@ class AIAgent:
                     )
                     return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
                 raise
+            except TypeError as exc:
+                if "'NoneType' object is not iterable" not in str(exc):
+                    raise
+                if terminal_event_type is not None:
+                    raise
+                recovered_response = self._recover_codex_stream_response(
+                    final_response=None,
+                    collected_output_items=collected_output_items,
+                    text_parts=self._codex_streamed_text_parts,
+                    has_tool_calls=has_tool_calls,
+                    model=api_kwargs.get("model"),
+                    reason="SDK null-output terminal event",
+                )
+                if recovered_response is not None:
+                    return recovered_response
+                raise
+
+    def _recover_codex_stream_response(
+        self,
+        *,
+        final_response: Any = None,
+        collected_output_items: list,
+        text_parts: list,
+        has_tool_calls: bool,
+        model: Any,
+        reason: str,
+    ):
+        """Build a final response from stream events the SDK could not expose."""
+        if collected_output_items:
+            output = list(collected_output_items)
+            logger.debug(
+                "Codex stream: recovered %d output items from stream events after %s",
+                len(collected_output_items),
+                reason,
+            )
+        elif text_parts and not has_tool_calls:
+            assembled = "".join(text_parts)
+            output = [SimpleNamespace(
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[SimpleNamespace(type="output_text", text=assembled)],
+            )]
+            logger.debug(
+                "Codex stream: synthesized output from %d text deltas (%d chars) after %s",
+                len(text_parts), len(assembled), reason,
+            )
+        else:
+            return None
+
+        if final_response is not None:
+            final_response.output = output
+            return final_response
+        return SimpleNamespace(output=output, status="completed", model=model)
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Fallback path for stream completion edge cases on Codex-style Responses backends."""
@@ -11829,6 +11883,10 @@ class AIAgent:
             try:
                 _query = original_user_message if isinstance(original_user_message, str) else ""
                 _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
+                _ext_prefetch_cache = limit_memory_prefetch_context(
+                    _ext_prefetch_cache,
+                    self.memory_prefetch_char_limit,
+                )
             except Exception:
                 pass
 

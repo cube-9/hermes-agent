@@ -11,6 +11,7 @@ from tools.session_search_tool import (
     _truncate_around_matches,
     _get_session_search_max_concurrency,
     _list_recent_sessions,
+    _get_session_search_timeout,
     _HIDDEN_SESSION_SOURCES,
     MAX_SESSION_CHARS,
     SESSION_SEARCH_SCHEMA,
@@ -195,6 +196,214 @@ class TestSessionSearchConcurrency:
         )
         assert _get_session_search_max_concurrency() == 5
 
+    def test_timeout_defaults_to_thirty_seconds(self):
+        assert _get_session_search_timeout() == 30.0
+
+    def test_timeout_reads_configured_value(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"auxiliary": {"session_search": {"timeout": 7.5}}},
+        )
+
+        assert _get_session_search_timeout() == 7.5
+
+    def test_timeout_rejects_non_positive_configured_value(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"auxiliary": {"session_search": {"timeout": 0}}},
+        )
+
+        assert _get_session_search_timeout() == 30.0
+
+    @pytest.mark.parametrize("configured_timeout", [float("nan"), float("inf")])
+    def test_timeout_rejects_non_finite_configured_value(
+        self, monkeypatch, configured_timeout
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"auxiliary": {"session_search": {"timeout": configured_timeout}}},
+        )
+
+        assert _get_session_search_timeout() == 30.0
+
+    def test_session_search_returns_structured_timeout_result(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        async def slow_summarize(_text, _query, _meta, *, timeout=None):
+            await asyncio.sleep(10)
+            return "late summary"
+
+        monkeypatch.setattr("tools.session_search_tool._summarize_session", slow_summarize)
+        monkeypatch.setattr("tools.session_search_tool._get_session_search_timeout", lambda: 0.01)
+        monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "s1",
+                "source": "cli",
+                "session_started": 1709500000,
+                "model": "test",
+            }
+        ]
+        mock_db.get_session.return_value = {
+            "id": "s1",
+            "parent_session_id": None,
+            "source": "cli",
+            "started_at": 1709500000,
+        }
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "article list memory"},
+            {"role": "assistant", "content": "saved article one"},
+        ]
+
+        result = json.loads(session_search(query="article", db=mock_db, limit=1))
+
+        assert result["success"] is False
+        assert result["query"] == "article"
+        assert result["timeout_seconds"] == 0.01
+        assert result["sessions_prepared"] == 1
+        assert "timed out" in result["error"].lower()
+
+    def test_session_search_returns_interrupt_result_before_summarizing(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        summarize_called = {"value": False}
+
+        async def fake_summarize(_text, _query, _meta, *, timeout=None):
+            summarize_called["value"] = True
+            return "summary"
+
+        monkeypatch.setattr("tools.session_search_tool._summarize_session", fake_summarize)
+        monkeypatch.setattr("tools.session_search_tool._session_search_interrupted", lambda: True)
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "s1",
+                "source": "cli",
+                "session_started": 1709500000,
+                "model": "test",
+            }
+        ]
+        mock_db.get_session.return_value = {
+            "id": "s1",
+            "parent_session_id": None,
+            "source": "cli",
+            "started_at": 1709500000,
+        }
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "article list memory"},
+            {"role": "assistant", "content": "saved article one"},
+        ]
+
+        result = json.loads(session_search(query="article", db=mock_db, limit=1))
+
+        assert result["success"] is False
+        assert result["query"] == "article"
+        assert result["interrupted"] is True
+        assert "interrupted" in result["error"].lower()
+        assert summarize_called["value"] is False
+
+    def test_session_search_returns_interrupt_result_from_bounded_summary(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        interrupt_checks = []
+        summarize_called = {"value": False}
+
+        def fake_interrupted():
+            interrupt_checks.append(True)
+            return len(interrupt_checks) > 1
+
+        async def fake_summarize(_text, _query, _meta, *, timeout=None):
+            summarize_called["value"] = True
+            return "summary"
+
+        monkeypatch.setattr("tools.session_search_tool._session_search_interrupted", fake_interrupted)
+        monkeypatch.setattr("tools.session_search_tool._summarize_session", fake_summarize)
+        monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "s1",
+                "source": "cli",
+                "session_started": 1709500000,
+                "model": "test",
+            },
+            {
+                "session_id": "s2",
+                "source": "cli",
+                "session_started": 1709500001,
+                "model": "test",
+            },
+        ]
+        mock_db.get_session.side_effect = lambda sid: {
+            "id": sid,
+            "parent_session_id": None,
+            "source": "cli",
+            "started_at": 1709500000,
+        }
+        mock_db.get_messages_as_conversation.side_effect = lambda sid: [
+            {"role": "user", "content": f"article list memory from {sid}"},
+            {"role": "assistant", "content": "saved article one"},
+        ]
+
+        result = json.loads(session_search(query="article", db=mock_db, limit=2))
+
+        assert result["success"] is False
+        assert result["query"] == "article"
+        assert result["interrupted"] is True
+        assert "interrupted" in result["error"].lower()
+        assert result["sessions_prepared"] == 2
+        assert summarize_called["value"] is False
+
+    def test_session_search_passes_sanitized_timeout_to_summarizer(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"auxiliary": {"session_search": {"timeout": 7.5}}},
+        )
+
+        captured = {}
+
+        async def fake_summarize(_text, _query, _meta, *, timeout=None):
+            captured["timeout"] = timeout
+            return "summary"
+
+        monkeypatch.setattr("tools.session_search_tool._summarize_session", fake_summarize)
+        monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "s1",
+                "source": "cli",
+                "session_started": 1709500000,
+                "model": "test",
+            }
+        ]
+        mock_db.get_session.return_value = {
+            "id": "s1",
+            "parent_session_id": None,
+            "source": "cli",
+            "started_at": 1709500000,
+        }
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "article list memory"},
+            {"role": "assistant", "content": "saved article one"},
+        ]
+
+        result = json.loads(session_search(query="article", db=mock_db, limit=1))
+
+        assert result["success"] is True
+        assert captured["timeout"] == 7.5
+
     def test_session_search_respects_configured_concurrency_limit(self, monkeypatch):
         from unittest.mock import MagicMock
         from tools.session_search_tool import session_search
@@ -207,7 +416,7 @@ class TestSessionSearchConcurrency:
         max_seen = {"value": 0}
         active = {"value": 0}
 
-        async def fake_summarize(_text, _query, _meta):
+        async def fake_summarize(_text, _query, _meta, *, timeout=None):
             active["value"] += 1
             max_seen["value"] = max(max_seen["value"], active["value"])
             await asyncio.sleep(0.01)

@@ -14,6 +14,8 @@ Tests cover:
 
 import asyncio
 import json
+import logging
+import threading
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -28,13 +30,13 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _IdempotencyCache,
     _CORS_HEADERS,
+    STATELESS_HEADER,
     _derive_chat_session_id,
+    _log_safe,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
 )
-
-
 # ---------------------------------------------------------------------------
 # check_api_server_requirements
 # ---------------------------------------------------------------------------
@@ -194,6 +196,38 @@ class TestIdempotencyCache:
         gate.set()
         assert await second == "response"
 
+    @pytest.mark.asyncio
+    async def test_cancelled_waiter_can_cancel_owned_inflight_task(self):
+        cache = _IdempotencyCache()
+        gate = asyncio.Event()
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def compute():
+            started.set()
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return "response"
+
+        first = asyncio.create_task(
+            cache.get_or_set(
+                "idem-key",
+                "fp-1",
+                compute,
+                cancel_inflight_on_waiter_cancel=True,
+            )
+        )
+
+        await started.wait()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        assert cancelled.is_set()
+
 
 # ---------------------------------------------------------------------------
 # Adapter initialization
@@ -281,6 +315,261 @@ class TestAdapterInit:
 
         assert isinstance(agent, FakeAgent)
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+
+    def test_voice_mode_create_agent_uses_api_server_toolsets_and_normal_iteration_budget(self, adapter, monkeypatch):
+        created = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                created.update(kwargs)
+
+        monkeypatch.setenv("HERMES_MAX_ITERATIONS", "90")
+        monkeypatch.setenv("HERMES_VOICE_MAX_ITERATIONS", "2")
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        with (
+            patch("run_agent.AIAgent", FakeAgent),
+            patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": ["files", "memory"]}}),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value={"files", "memory"}),
+            patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None),
+        ):
+            adapter._create_agent(voice_mode=True)
+
+        assert created["enabled_toolsets"] == ["files", "memory"]
+        assert created["max_iterations"] == 90
+
+    def test_voice_mode_removes_session_search_by_default(self, adapter, monkeypatch):
+        created = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                created.update(kwargs)
+
+        monkeypatch.delenv("HERMES_API_VOICE_DISABLED_TOOLSETS", raising=False)
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        with (
+            patch("run_agent.AIAgent", FakeAgent),
+            patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": ["files", "session_search", "skills"]}}),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value={"files", "session_search", "skills"}),
+            patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None),
+        ):
+            adapter._create_agent(voice_mode=True)
+
+        assert created["enabled_toolsets"] == ["files", "skills"]
+
+    def test_voice_mode_disabled_toolsets_can_be_configured(self, adapter, monkeypatch):
+        created = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                created.update(kwargs)
+
+        monkeypatch.setenv("HERMES_API_VOICE_DISABLED_TOOLSETS", "session_search,skills")
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        with (
+            patch("run_agent.AIAgent", FakeAgent),
+            patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": ["files", "session_search", "skills"]}}),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value={"files", "session_search", "skills"}),
+            patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None),
+        ):
+            adapter._create_agent(voice_mode=True)
+
+        assert created["enabled_toolsets"] == ["files"]
+
+    def test_text_mode_keeps_session_search_toolset(self, adapter, monkeypatch):
+        created = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                created.update(kwargs)
+
+        monkeypatch.delenv("HERMES_API_VOICE_DISABLED_TOOLSETS", raising=False)
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        with (
+            patch("run_agent.AIAgent", FakeAgent),
+            patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": ["files", "session_search", "skills"]}}),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value={"files", "session_search", "skills"}),
+            patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None),
+        ):
+            adapter._create_agent(voice_mode=False)
+
+        assert created["enabled_toolsets"] == ["files", "session_search", "skills"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_interrupts_agent_when_async_task_is_cancelled(adapter, monkeypatch):
+    created_agent = {}
+    entered_run = threading.Event()
+    release_run = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self, **kwargs):
+            self.interrupt_reason = None
+            created_agent["agent"] = self
+
+        def run_conversation(self, **kwargs):
+            entered_run.set()
+            while not release_run.is_set():
+                time.sleep(0.01)
+            return {"final_response": "late"}
+
+        def interrupt(self, reason):
+            self.interrupt_reason = reason
+            release_run.set()
+
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+    with (
+        patch("run_agent.AIAgent", FakeAgent),
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": []}}),
+        patch("hermes_cli.tools_config._get_platform_tools", return_value=set()),
+        patch("gateway.run.GatewayRunner._load_fallback_model", return_value={}),
+    ):
+        task = asyncio.create_task(
+            adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="cancel-test",
+                api_trace_id="cancel-trace",
+                agent_ref=[None],
+            )
+        )
+        assert await asyncio.to_thread(entered_run.wait, 1.0) is True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert created_agent["agent"].interrupt_reason == "api task cancelled"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_preserves_existing_interrupt_reason_when_cancelled(adapter, monkeypatch):
+    agent_ref = [None]
+    entered_run = threading.Event()
+    release_run = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self, **kwargs):
+            self._interrupt_requested = True
+            self.interrupt_reason = "SSE client disconnected"
+            self.interrupt_calls = []
+
+        def run_conversation(self, **kwargs):
+            entered_run.set()
+            release_run.wait(1.0)
+            return {"final_response": "late"}
+
+        def interrupt(self, reason):
+            self.interrupt_calls.append(reason)
+            self.interrupt_reason = reason
+
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+    with (
+        patch("run_agent.AIAgent", FakeAgent),
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": []}}),
+        patch("hermes_cli.tools_config._get_platform_tools", return_value=set()),
+        patch("gateway.run.GatewayRunner._load_fallback_model", return_value={}),
+    ):
+        task = asyncio.create_task(
+            adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="cancel-test",
+                api_trace_id="cancel-trace",
+                agent_ref=agent_ref,
+            )
+        )
+        assert await asyncio.to_thread(entered_run.wait, 1.0) is True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release_run.set()
+
+    agent = agent_ref[0]
+    assert agent.interrupt_calls == []
+    assert agent.interrupt_reason == "SSE client disconnected"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_intercepts_cancellation_before_agent_ref_is_published(adapter, monkeypatch):
+    create_started = threading.Event()
+    release_create = threading.Event()
+    created = {}
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self):
+            self.interrupt_reason = None
+            self.run_called = False
+            created["agent"] = self
+
+        def interrupt(self, reason):
+            self.interrupt_reason = reason
+
+        def run_conversation(self, **kwargs):
+            self.run_called = True
+            return {"final_response": "should not run"}
+
+    def fake_create_agent(**kwargs):
+        create_started.set()
+        release_create.wait(1.0)
+        return FakeAgent()
+
+    monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
+
+    agent_ref = [None]
+    task = asyncio.create_task(
+        adapter._run_agent(
+            user_message="hello",
+            conversation_history=[],
+            session_id="pre-ref-cancel-test",
+            api_trace_id="pre-ref-cancel-trace",
+            agent_ref=agent_ref,
+        )
+    )
+    assert await asyncio.to_thread(create_started.wait, 1.0) is True
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release_create.set()
+
+    for _ in range(100):
+        agent = created.get("agent")
+        if agent is not None and agent.interrupt_reason:
+            break
+        await asyncio.sleep(0.01)
+
+    agent = created["agent"]
+    assert agent_ref[0] is agent
+    assert agent.interrupt_reason == "api task cancelled"
+    assert agent.run_called is False
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +908,133 @@ class TestCapabilitiesEndpoint:
 
 
 class TestChatCompletionsEndpoint:
+    @staticmethod
+    def _streamed_chat_delta_text(body):
+        streamed_text = ""
+        for line in body.splitlines():
+            if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                continue
+            chunk = json.loads(line[len("data: "):])
+            for choice in chunk.get("choices", []):
+                streamed_text += choice.get("delta", {}).get("content", "")
+        return streamed_text
+
+    def test_log_safe_replaces_controls_and_caps_length(self):
+        assert _log_safe("abc\n\x00\tdef", max_length=20) == "abc---def"
+        assert _log_safe("x" * 10, max_length=4) == "xxxx"
+        assert _log_safe(123, max_length=10) == "123"
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_api_request_started_accepts_voice_trace_header(self, adapter, caplog):
+        """Voice callers can provide a trace id that appears in logs and response headers."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "ok",
+                "messages": [],
+                "api_calls": 1,
+            }
+            mock_agent.session_prompt_tokens = 1
+            mock_agent.session_completion_tokens = 1
+            mock_agent.session_total_tokens = 2
+
+            with (
+                patch.object(adapter, "_create_agent", return_value=mock_agent),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer test-key",
+                        "X-Hermes-Trace-Id": "voice-session-123-turn-1",
+                        "X-Hermes-Voice-Session-Id": "session-123",
+                        "X-Hermes-Voice-Turn-Id": "1",
+                    },
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+
+            assert resp.status == 200
+            assert resp.headers["X-Hermes-Trace-Id"] == "voice-session-123-turn-1"
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api request started" in log_text
+            assert "trace_id=voice-session-123-turn-1" in log_text
+            assert "voice_session_id=session-123" in log_text
+            assert "voice_turn_id=1" in log_text
+            assert "api agent task started trace_id=voice-session-123-turn-1" in log_text
+            assert "api agent task completed trace_id=voice-session-123-turn-1" in log_text
+            assert "endpoint=/v1/chat/completions" in log_text
+            assert "stream=False" in log_text
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_generates_trace_header_when_missing(self, adapter):
+        """Non-voice callers still get a generated trace id for postmortem debugging."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+
+            assert resp.status == 200
+            trace_id = resp.headers["X-Hermes-Trace-Id"]
+            assert trace_id.startswith("api-")
+            assert len(trace_id) == len("api-") + 16
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_request_start_log_sanitizes_user_strings(self, auth_adapter, caplog):
+        """Request-start logs should not contain raw control characters from model or role fields."""
+        raw_session_id = "session-\x1b[" + ("x" * 160)
+        request = MagicMock()
+        request.headers = {
+            "Authorization": "Bearer sk-secret",
+            "X-Hermes-Session-Id": raw_session_id,
+        }
+        request.json = AsyncMock(return_value={
+            "model": "unsafe\nmodel\x00name",
+            "messages": [
+                {"role": "system\nrole\x00name", "content": "ignored"},
+                {"role": "user", "content": "hello"},
+            ],
+        })
+
+        async def _mock_run_agent(**kwargs):
+            return (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        with (
+            patch.object(auth_adapter, "_ensure_session_db", side_effect=RuntimeError("db down")),
+            patch.object(auth_adapter, "_run_agent", side_effect=_mock_run_agent),
+            caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+        ):
+            resp = await auth_adapter._handle_chat_completions(request)
+
+        assert resp.status == 200
+        assert resp.headers["X-Hermes-Session-Id"] == raw_session_id
+        log_text = "\n".join(record.getMessage() for record in caplog.records)
+        assert "model=unsafe-model-name" in log_text
+        assert "roles=system-role-name,user" in log_text
+        assert f"session_id={_log_safe(raw_session_id)}" in log_text
+        assert f"Failed to load session history for {_log_safe(raw_session_id)}" in log_text
+        assert "unsafe\nmodel" not in log_text
+        assert "system\nrole" not in log_text
+        assert raw_session_id not in log_text
+
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)
@@ -680,6 +1096,404 @@ class TestChatCompletionsEndpoint:
                 assert "data: " in body
                 assert "[DONE]" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_streaming_voice_trace_headers_reach_run_agent_lifecycle(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.side_effect = lambda **_kwargs: {
+                "final_response": "Hello stream",
+                "messages": [],
+                "api_calls": 1,
+            }
+            mock_agent.session_prompt_tokens = 1
+            mock_agent.session_completion_tokens = 2
+            mock_agent.session_total_tokens = 3
+
+            with (
+                patch.object(adapter, "_create_agent", return_value=mock_agent),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Trace-Id": "voice-session-123-turn-2",
+                        "X-Hermes-Voice-Session-Id": "session-123",
+                        "X-Hermes-Voice-Turn-Id": "2",
+                    },
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "[DONE]" in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api agent task started trace_id=voice-session-123-turn-2" in log_text
+            assert "api agent create started trace_id=voice-session-123-turn-2" in log_text
+            assert "api agent create completed trace_id=voice-session-123-turn-2" in log_text
+            assert "api agent run_conversation started trace_id=voice-session-123-turn-2" in log_text
+            assert "api agent run_conversation completed trace_id=voice-session-123-turn-2" in log_text
+            assert "api agent task completed trace_id=voice-session-123-turn-2" in log_text
+            assert "voice_session_id=session-123" in log_text
+            assert "voice_turn_id=2" in log_text
+
+    @pytest.mark.asyncio
+    async def test_streaming_voice_trace_logs_agent_create_failure(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_create_agent", side_effect=RuntimeError("create boom")),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Trace-Id": "voice-create-failure",
+                        "X-Hermes-Voice-Session-Id": "session-create-failure",
+                        "X-Hermes-Voice-Turn-Id": "3",
+                    },
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "event: error" in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api agent create started trace_id=voice-create-failure" in log_text
+            assert "api agent create failed trace_id=voice-create-failure" in log_text
+            assert "api agent run_conversation started trace_id=voice-create-failure" not in log_text
+
+    @pytest.mark.asyncio
+    async def test_streaming_voice_trace_logs_run_conversation_failure(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.side_effect = RuntimeError("run boom")
+
+            with (
+                patch.object(adapter, "_create_agent", return_value=mock_agent),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Trace-Id": "voice-run-failure",
+                        "X-Hermes-Voice-Session-Id": "session-run-failure",
+                        "X-Hermes-Voice-Turn-Id": "4",
+                    },
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "event: error" in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api agent create completed trace_id=voice-run-failure" in log_text
+            assert "api agent run_conversation started trace_id=voice-run-failure" in log_text
+            assert "api agent run_conversation failed trace_id=voice-run-failure" in log_text
+            assert "api agent run_conversation completed trace_id=voice-run-failure" not in log_text
+
+    @pytest.mark.asyncio
+    async def test_stream_logs_chunk_and_completion_metrics(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Hel")
+                    cb("lo")
+                return (
+                    {"final_response": "Hello", "messages": [], "api_calls": 1},
+                    {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Trace-Id": "trace-stream-ok"},
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert self._streamed_chat_delta_text(body) == "Hello"
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream first_text_delta trace_id=trace-stream-ok" in log_text
+            assert "api stream completed trace_id=trace-stream-ok" in log_text
+            assert "text_chunks=2" in log_text
+            assert "text_chars=5" in log_text
+
+    @pytest.mark.asyncio
+    async def test_stream_warns_when_final_response_was_not_emitted(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {"final_response": "Hello", "messages": [], "api_calls": 1},
+                    {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Trace-Id": "trace-no-delta"},
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert self._streamed_chat_delta_text(body) == ""
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream zero body trace_id=trace-no-delta" in log_text
+            assert "api stream completed trace_id=trace-no-delta" not in log_text
+            assert "text_chunks=0" in log_text
+            assert "text_chars=0" in log_text
+            assert "final_response_chars=5" in log_text
+
+    @pytest.mark.asyncio
+    async def test_voice_stream_times_out_when_no_first_text_delta(self, adapter, caplog, monkeypatch):
+        monkeypatch.setenv("HERMES_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS", "0.05")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                await asyncio.sleep(5)
+                return (
+                    {"final_response": "late answer", "messages": [], "api_calls": 1},
+                    {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.WARNING, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Trace-Id": "voice-timeout-test",
+                        "X-Hermes-Voice-Session-Id": "session-timeout-test",
+                        "X-Hermes-Voice-Turn-Id": "5",
+                    },
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "Which article should we discuss next?"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "event: error" in body
+            assert "first assistant text" in body
+            assert "[DONE]" in body
+            assert self._streamed_chat_delta_text(body) == ""
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream first_text_timeout trace_id=voice-timeout-test" in log_text
+            assert "voice_session_id=session-timeout-test" in log_text
+            assert "voice_turn_id=5" in log_text
+
+    @pytest.mark.asyncio
+    async def test_voice_stream_quiet_completion_keeps_zero_body_behavior(self, adapter, caplog, monkeypatch):
+        monkeypatch.setenv("HERMES_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS", "0.05")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                await asyncio.sleep(0.01)
+                return (
+                    {"final_response": "", "messages": [], "api_calls": 1},
+                    {"input_tokens": 2, "output_tokens": 0, "total_tokens": 2},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.WARNING, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Trace-Id": "voice-quiet-complete-test",
+                        "X-Hermes-Voice-Session-Id": "session-quiet-complete-test",
+                        "X-Hermes-Voice-Turn-Id": "6",
+                    },
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "[DONE]" in body
+            assert "event: error" not in body
+            assert self._streamed_chat_delta_text(body) == ""
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream zero body trace_id=voice-quiet-complete-test" in log_text
+            assert "api stream first_text_timeout" not in log_text
+
+    @pytest.mark.asyncio
+    async def test_non_voice_stream_keeps_existing_quiet_stream_behavior(self, adapter, caplog, monkeypatch):
+        monkeypatch.setenv("HERMES_VOICE_FIRST_TEXT_DELTA_TIMEOUT_SECONDS", "0.05")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                await asyncio.sleep(0.08)
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("late non voice text")
+                return (
+                    {"final_response": "late non voice text", "messages": [], "api_calls": 1},
+                    {"input_tokens": 2, "output_tokens": 4, "total_tokens": 6},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.INFO, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Trace-Id": "non-voice-no-timeout"},
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert self._streamed_chat_delta_text(body) == "late non voice text"
+            assert "event: error" not in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream first_text_timeout" not in log_text
+
+    @pytest.mark.asyncio
+    async def test_stream_logs_zero_body_warning(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {"final_response": "", "messages": [], "api_calls": 1},
+                    {"input_tokens": 2, "output_tokens": 0, "total_tokens": 2},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.WARNING, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Trace-Id": "trace-zero-body"},
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "[DONE]" in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream zero body trace_id=trace-zero-body" in log_text
+            assert "text_chunks=0" in log_text
+            assert "final_response_chars=0" in log_text
+
+    @pytest.mark.asyncio
+    async def test_stream_agent_exception_emits_error_event_before_deltas(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                raise RuntimeError("agent exploded")
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.ERROR, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Trace-Id": "trace-fail-before"},
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert "event: error" in body
+            assert "agent exploded" in body
+            assert "trace-fail-before" in body
+            assert '"finish_reason": "stop"' not in body
+            assert "[DONE]" not in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream failed trace_id=trace-fail-before" in log_text
+            assert "text_chunks=0" in log_text
+            assert "text_chars=0" in log_text
+
+    @pytest.mark.asyncio
+    async def test_stream_agent_exception_emits_error_event_after_delta(self, adapter, caplog):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Partial")
+                raise RuntimeError("agent failed late")
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                caplog.at_level(logging.ERROR, logger="gateway.platforms.api_server"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Trace-Id": "trace-fail-after"},
+                    json={
+                        "model": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.text()
+
+            assert resp.status == 200
+            assert self._streamed_chat_delta_text(body) == "Partial"
+            assert "event: error" in body
+            assert "agent failed late" in body
+            assert "trace-fail-after" in body
+            assert '"finish_reason": "stop"' not in body
+            assert "[DONE]" not in body
+            log_text = "\n".join(record.getMessage() for record in caplog.records)
+            assert "api stream failed trace_id=trace-fail-after" in log_text
+            assert "text_chunks=1" in log_text
+            assert "text_chars=7" in log_text
 
     @pytest.mark.asyncio
     async def test_stream_sends_keepalive_during_quiet_tool_gap(self, adapter):
@@ -2613,6 +3427,59 @@ class TestCORS:
             assert "Idempotency-Key" in resp.headers.get("Access-Control-Allow-Headers", "")
 
     @pytest.mark.asyncio
+    async def test_cors_allows_trace_header_and_exposes_response_ids(self):
+        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.options(
+                "/v1/chat/completions",
+                headers={
+                    "Origin": "http://localhost:3000",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "X-Hermes-Trace-Id",
+                },
+            )
+            assert resp.status == 200
+            allow_headers = resp.headers.get("Access-Control-Allow-Headers", "")
+            assert "X-Hermes-Trace-Id" in allow_headers
+            assert "X-Hermes-Session-Id" in allow_headers
+            assert STATELESS_HEADER in allow_headers
+            expose_headers = resp.headers.get("Access-Control-Expose-Headers", "")
+            assert "X-Hermes-Trace-Id" in expose_headers
+            assert "X-Hermes-Session-Id" in expose_headers
+
+    @pytest.mark.asyncio
+    async def test_cors_exposes_trace_and_session_headers_on_chat_completion(self):
+        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Origin": "http://localhost:3000",
+                        "X-Hermes-Trace-Id": "browser-trace-123",
+                    },
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+
+            assert resp.status == 200
+            assert resp.headers["X-Hermes-Trace-Id"] == "browser-trace-123"
+            assert resp.headers.get("X-Hermes-Session-Id")
+            expose_headers = resp.headers.get("Access-Control-Expose-Headers", "")
+            assert "X-Hermes-Trace-Id" in expose_headers
+            assert "X-Hermes-Session-Id" in expose_headers
+
+    @pytest.mark.asyncio
     async def test_cors_sets_vary_origin_header(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
         app = _create_app(adapter)
@@ -2859,6 +3726,157 @@ class TestSessionIdHeader:
             assert call_kwargs["user_message"] == "new question"
 
     @pytest.mark.asyncio
+    async def test_voice_session_id_bounds_loaded_db_history(self, auth_adapter, monkeypatch):
+        """Voice-mode requests bound DB-loaded history before passing it to the agent."""
+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+        db_history = [
+            {"role": "user", "content": f"stored message {index}"}
+            for index in range(6)
+        ]
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = db_history
+        auth_adapter._session_db = mock_db
+        monkeypatch.setenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", "3")
+        monkeypatch.setenv("HERMES_VOICE_MAX_MEMORY_PREFETCH_CHARS", "4321")
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "existing-session", "Authorization": "Bearer sk-secret"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "HERMES_VOICE_MODE=1 realtime voice session",
+                            },
+                            {"role": "user", "content": "new voice question"},
+                        ],
+                    },
+                )
+
+            assert resp.status == 200
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["conversation_history"] == db_history[-3:]
+            assert call_kwargs["user_message"] == "new voice question"
+            assert call_kwargs["memory_prefetch_char_limit"] == 4321
+
+    @pytest.mark.asyncio
+    async def test_voice_mode_bounds_request_body_history_without_session_header(self, adapter, monkeypatch):
+        """Voice-mode requests bound OpenAI request-body history on the Pipecat path."""
+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+        monkeypatch.setenv("HERMES_VOICE_MAX_HISTORY_MESSAGES", "2")
+        monkeypatch.setenv("HERMES_VOICE_MAX_MEMORY_PREFETCH_CHARS", "9876")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {"role": "system", "content": "HERMES_VOICE_MODE=1 realtime voice session"},
+                            {"role": "user", "content": "old question 1"},
+                            {"role": "assistant", "content": "old answer 1"},
+                            {"role": "user", "content": "old question 2"},
+                            {"role": "assistant", "content": "old answer 2"},
+                            {"role": "user", "content": "new voice question"},
+                        ],
+                    },
+                )
+
+            assert resp.status == 200
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["conversation_history"] == [
+                {"role": "user", "content": "old question 2"},
+                {"role": "assistant", "content": "old answer 2"},
+            ]
+            assert call_kwargs["user_message"] == "new voice question"
+            assert call_kwargs["memory_prefetch_char_limit"] == 9876
+            assert call_kwargs["voice_mode"] is True
+
+    @pytest.mark.asyncio
+    async def test_non_voice_mode_keeps_normal_agent_tools(self, adapter):
+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "normal question"}],
+                    },
+                )
+
+            assert resp.status == 200
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["memory_prefetch_char_limit"] is None
+            assert call_kwargs["voice_mode"] is False
+
+    @pytest.mark.asyncio
+    async def test_idempotent_chat_completion_cancellation_interrupts_agent(self, adapter, monkeypatch):
+        request = MagicMock()
+        request.headers = {"Idempotency-Key": f"idem-{uuid.uuid4().hex}"}
+        request.json = AsyncMock(return_value={
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        entered_run = threading.Event()
+        release_run = threading.Event()
+        created_agent = {}
+
+        class FakeAgent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+
+            def __init__(self, **kwargs):
+                self.interrupt_reason = None
+                created_agent["agent"] = self
+
+            def run_conversation(self, **kwargs):
+                entered_run.set()
+                while not release_run.is_set():
+                    time.sleep(0.01)
+                return {"final_response": "late", "messages": [], "api_calls": 1}
+
+            def interrupt(self, reason):
+                self.interrupt_reason = reason
+                release_run.set()
+
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        with (
+            patch("run_agent.AIAgent", FakeAgent),
+            patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("gateway.run._load_gateway_config", return_value={"platform_toolsets": {"api_server": []}}),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value=set()),
+            patch("gateway.run.GatewayRunner._load_fallback_model", return_value={}),
+        ):
+            task = asyncio.create_task(adapter._handle_chat_completions(request))
+            assert await asyncio.to_thread(entered_run.wait, 1.0) is True
+            task.cancel()
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                release_run.set()
+
+        assert created_agent["agent"].interrupt_reason == "api task cancelled"
+
+    @pytest.mark.asyncio
     async def test_db_failure_falls_back_to_empty_history(self, auth_adapter):
         """If SessionDB raises, history falls back to empty and request still succeeds."""
         mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
@@ -2881,6 +3899,73 @@ class TestSessionIdHeader:
             assert call_kwargs["conversation_history"] == []
             assert call_kwargs["session_id"] == "some-session"
 
+    @pytest.mark.asyncio
+    async def test_stateless_header_uses_request_history_and_unique_session(self, auth_adapter):
+        """Diagnostic replays can avoid accumulated Hermes session state."""
+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "stored message"},
+            {"role": "assistant", "content": "stored reply"},
+        ]
+        auth_adapter._session_db = mock_db
+
+        app = _create_app(auth_adapter)
+        body = {
+            "model": "hermes-agent",
+            "messages": [
+                {"role": "user", "content": "request message 1"},
+                {"role": "assistant", "content": "request reply 1"},
+                {"role": "user", "content": "new question"},
+            ],
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+                first_resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={STATELESS_HEADER: "1", "Authorization": "Bearer sk-secret"},
+                    json=body,
+                )
+                second_resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={STATELESS_HEADER: "1", "Authorization": "Bearer sk-secret"},
+                    json=body,
+                )
+
+        assert first_resp.status == 200
+        assert second_resp.status == 200
+        assert first_resp.headers["X-Hermes-Session-Id"] != second_resp.headers["X-Hermes-Session-Id"]
+        assert mock_db.get_messages_as_conversation.call_count == 0
+
+        first_call = mock_run.call_args_list[0].kwargs
+        second_call = mock_run.call_args_list[1].kwargs
+        assert first_call["conversation_history"] == [
+            {"role": "user", "content": "request message 1"},
+            {"role": "assistant", "content": "request reply 1"},
+        ]
+        assert first_call["user_message"] == "new question"
+        assert first_call["session_id"].startswith("api-stateless-")
+        assert second_call["session_id"].startswith("api-stateless-")
+        assert first_call["session_id"] != second_call["session_id"]
+
+    @pytest.mark.asyncio
+    async def test_stateless_header_conflicts_with_session_continuation(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                headers={
+                    STATELESS_HEADER: "1",
+                    "X-Hermes-Session-Id": "existing-session",
+                    "Authorization": "Bearer sk-secret",
+                },
+                json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+
+        assert resp.status == 400
 
 # ---------------------------------------------------------------------------
 # X-Hermes-Session-Key header (long-term memory scoping)
@@ -3061,4 +4146,3 @@ class TestSessionKeyHeader:
             assert resp.status == 200
             data = await resp.json()
             assert data["features"]["session_key_header"] == "X-Hermes-Session-Key"
-
